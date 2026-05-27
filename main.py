@@ -114,7 +114,7 @@ def analyze(symbol, btc_5m, btc_20m):
         # Kalite ve Hacim Barajı
         if daily_volume < MIN_DAILY_VOLUME: return None
         
-        # CRITICAL FILTER: Long/Short Oranı Düşük Olmalı (Senin istediğin: Longçular ezilmiş/temizlenmiş olacak)
+        # CRITICAL FILTER: Long/Short Oranı Düşük Olmalı (Longlar baskı altında/dökülmüş olacak)
         if global_ls > LONG_SHORT_MAX_THRESHOLD: return None
 
         # 2. 14 Günlük Tarihsel Dip Analizi
@@ -140,89 +140,18 @@ def analyze(symbol, btc_5m, btc_20m):
         price_change_20m = ((closes[-1] - closes[-4]) / closes[-4]) * 100
 
         # BTC'DEN BAĞIMSIZ HAREKET ETME GÜCÜ (ALFA ETKİSİ)
-        # BTC düşerken veya sabitken bu coinin kafayı yukarı kaldırma oranı
         btc_relative_strength = price_change_5m - btc_5m
 
         # KATIDIR FİLTRELER (SPAM VE TEPE ALIMLARINI SIFIRLAR)
         if volume_ratio < VOLUME_BOOM_THRESHOLD: return None  # Güçlü hacim girişi şart
         if dip_distance < DIP_MIN_PERCENT: return None        # Kesinlikle dip bölgede olmalı
-        if price_change_20m > MAX_ALLOWED_PUMP: return None   # Zaten %5+ uçmuşsa es geç
-        if price_change_5m <= 0: return None                   # En son 5dk mumu yeşil olmalı (aksiyon başlamış)
+        if price_change_20m > MAX_ALLOWED_PUMP: return None   # Zaten uçmuşsa es geç
+        if price_change_5m <= 0: return None                   # En son 5dk mumu yeşil olmalı
 
-        # 🎯 SATIŞ NOKTALARINI HESAPLA (MANTIKLI TAKE PROFIT)
+        # 🎯 SATIŞ NOKTALARINI HESAPLA
         target_1, target_2 = calculate_targets(daily_klines, current_price)
 
         # 🌟 YAPAY ZEKA SKORLAMA FORMÜLÜ (MAX 20 PUAN)
         score = 0
         score += min(volume_ratio * 1.2, 6)             # Hacim Patlaması (Max 6)
-        score += min((1.5 - global_ls) * 4, 4)          # Temiz Long/Short Dengesi (Max 4)
-        score += min(dip_distance / 10, 4)              # Dipten Uzaklık / İndirim Oranı (Max 4)
-        score += min(oi_change * 1.5, 3)                # OI Para Girişi (Max 3)
-        if btc_relative_strength > 0.5: score += 3      # BTC'ye Meydan Okuma Bonusu (+3)
-
-        score = round(score, 2)
-
-        # Pro Sürüm Barajı: Sadece 7.5 ve üzeri alan Elit Sinyalleri yayınla
-        if score < 7.5: return None
-
-        return {
-            "symbol": symbol, "score": score, "price": current_price,
-            "volume_ratio": round(volume_ratio, 2), "oi_change": oi_change,
-            "dip_distance": round(dip_distance, 2), "price_change": round(price_change_20m, 2),
-            "global_ls": round(global_ls, 2), "btc_rel": round(btc_relative_strength, 2),
-            "target_1": target_1, "target_2": target_2, "funding": round(funding_rate, 4)
-        }
-    except:
-        return None
-
-def main():
-    sent_dict = {}
-    print("💎 PRO PLUS PLUS EXTRA SÜRÜM AYAĞA KALKTI 💎")
-    send_telegram("💎 *PRO PLUS PLUS EXTRA BOT AKTİF!* \n\n_Sistem şu andan itibaren hem dip taraması yapıyor hem de matematiksel satış hedeflerini hesaplıyor._")
-
-    while True:
-        try:
-            pairs = get_usdt_pairs()
-            btc_5m, btc_20m = check_btc_trend()
-            current_time = time.time()
-            
-            print(f"[{time.strftime('%H('%M:%S')')}] Tarama Aktif. {len(pairs)} çift izleniyor...")
-            
-            for symbol in pairs:
-                data = analyze(symbol, btc_5m, btc_20m)
-                
-                if data:
-                    # Aynı coinden 1 saat boyunca tek sinyal (Spam engelleme)
-                    if symbol not in sent_dict or (current_time - sent_dict[symbol] > 3600):
-                        
-                        msg = f"""🚨 *PRO PLUS PLUS EXTRA SİNYAL*
-
-🔹 *Coin:* #{data['symbol']}
-🌟 *Yapay Zeka Puanı:* `{data['score']} / 20`
-💵 *Güncel Giriş Fiyatı:* `{data['price']}`
------------------------------------------
-🎯 *MATEMATİKSEL SATIŞ HEDEFLERİ:*
-📌 *Hedef 1 (Kâr Al):* `{data['target_1']}` (İlk Güçlü Direnç)
-📌 *Hedef 2 (Ana Hedef):* `{data['target_2']}` (14 Günlük Pivot Zirvesi)
------------------------------------------
-📊 *Algoritmik Metrikler:*
-• 📉 Long/Short Ratio: `{data['global_ls']}` *(Longçular dökülmüş)*
-• 🔥 5m Hacim Artışı: `{data['volume_ratio']}x`
-• 🐳 Open Interest Değişimi: `%{data['oi_change']}`
-• 🧗 Zirveden Düşüş Oranı: `%{data['dip_distance']}`
-• ⚡ Son 20dk Fiyat Aksiyonu: `%{data['price_change']}`
-• 🦁 BTC Bağımsız Güç (Alfa): `{data['btc_rel']}`
------------------------------------------
-⚠️ _Bot, hacim kırılımını ve long temizliğini onayladı._"""
-                        
-                        send_telegram(msg)
-                        sent_dict[symbol] = current_time
-            
-            time.sleep(300) # 5 Dakika Bekleme Periyodu
-            
-        except Exception as e:
-            print(f"Sistem Hatası: {e}")
-            time.sleep(60)
-
-if __name__ == "__main__":
-    main()
+        score += min((1.5 - global_ls) * 4, 4)          # Tem
