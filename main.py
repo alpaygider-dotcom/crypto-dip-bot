@@ -18,16 +18,26 @@ def send_telegram(message):
     requests.post(url, data=data)
 
 def get_usdt_pairs():
-    url = f"{BINANCE_FUTURES}/fapi/v1/exchangeInfo"
-    data = requests.get(url).json()
+    try:
+        url = f"{BINANCE_FUTURES}/fapi/v1/exchangeInfo"
 
-    pairs = []
+        response = requests.get(url)
 
-    for s in data["symbols"]:
-        if s["quoteAsset"] == "USDT" and s["status"] == "TRADING":
-            pairs.append(s["symbol"])
+        data = response.json()
 
-    return pairs
+        if "symbols" not in data:
+            return []
+
+        pairs = []
+
+        for s in data["symbols"]:
+            if s["quoteAsset"] == "USDT" and s["status"] == "TRADING":
+                pairs.append(s["symbol"])
+
+        return pairs
+
+    except:
+        return []
 
 def get_klines(symbol):
     url = f"{BINANCE_FUTURES}/fapi/v1/klines"
