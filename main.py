@@ -16,59 +16,49 @@ def get_pairs():
     res = requests.get(f"{BINANCE_SPOT}/api/v3/exchangeInfo").json()
     return [s["symbol"] for s in res["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
 
-def get_klines(symbol, limit):
-    return requests.get(f"{BINANCE_SPOT}/api/v3/klines", params={"symbol": symbol, "interval": "5m", "limit": limit}).json()
-
 def check_zırhlı_tam(symbol, klines):
-    # 1. Filtre: Hacim Patlaması (2.3x)
+    # 1. Hacim Patlaması (2.3x)
     volumes = [float(k[5]) for k in klines]
     if mean(volumes[:-2]) == 0: return False
     ratio = volumes[-1] / mean(volumes[:-2])
     
-    # 2. Filtre: Fiyat aşırı şişmemiş mi? (Son 20dk değişim < %5)
-    closes = [float(k[4]) for k in klines]
-    pump_check = ((closes[-1] - closes[-4]) / closes[-4]) < 0.05
-    
-    # 3. Filtre: 10M$ Hacim şartı (24 saatlik)
+    # 2. Likidite Kontrolü (10M$ Hacim)
     ticker = requests.get(f"{BINANCE_SPOT}/api/v3/ticker/24hr", params={"symbol": symbol}).json()
     daily_vol = float(ticker.get("quoteVolume", 0))
     
-    return ratio > 2.3 and pump_check and daily_vol > 10000000
-
-def check_acaba_onaylı(symbol):
-    # OI (Açık Pozisyon) kontrolü - Sadece Futures için
+    # 3. LS Oranı (1.25 Altı - Balina baskısı yok)
     try:
-        oi = requests.get(f"{BINANCE_FUTURES}/futures/data/openInterestHist", params={"symbol": symbol, "period": "5m", "limit": 2}).json()
-        if len(oi) >= 2 and float(oi[1]["sumOpenInterest"]) > float(oi[0]["sumOpenInterest"]):
-            return "✅ ONAYLI (Balina girişi)"
-        return "⚠️ ONAYLANMADI"
-    except: return "❓ OI Verisi Yok"
+        ls_res = requests.get(f"{BINANCE_FUTURES}/futures/data/globalLongShortAccountRatio", 
+                              params={"symbol": symbol, "period": "5m", "limit": 1}).json()
+        ls_ratio = float(ls_res[0]["longShortRatio"])
+    except: ls_ratio = 1.0
+
+    return ratio > 2.3 and daily_vol > 10000000 and ls_ratio < 1.25
 
 def main():
     sent_dict = {}
-    print("🚀 GÜÇLENDİRİLMİŞ TARAMA BAŞLADI...")
+    print("🚀 DİPSİZ, SAF AVCI MODU AKTİF...")
     
     while True:
         pairs = get_pairs()
         for symbol in pairs:
             try:
-                klines = get_klines(symbol, 20)
+                klines = requests.get(f"{BINANCE_SPOT}/api/v3/klines", 
+                                     params={"symbol": symbol, "interval": "5m", "limit": 20}).json()
                 if len(klines) < 20: continue
                 
-                # ZIRHLI SİNYALİ
+                # ZIRHLI SİNYAL (Dip filtresi yok)
                 if check_zırhlı_tam(symbol, klines):
                     if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
-                        send_telegram(f"💎 *ZIRHLI SİNYAL!* #{symbol}\nKurallar tamam: 2.3x Hacim + 10M$ Likidite.")
+                        send_telegram(f"💎 *ZIRHLI SİNYAL!* #{symbol}\n• Hacim: 2.3x+\n• Likidite: 10M$+\n• LS Oranı: Balina temiz.")
                         sent_dict[symbol] = time.time()
                 
-                # ACABA SİNYALİ
+                # ACABA SİNYALİ (Dip filtresi yok)
                 else:
                     volumes = [float(k[5]) for k in klines]
-                    ratio = volumes[-1] / mean(volumes[:-2])
-                    if ratio > 1.5:
+                    if volumes[-1] / mean(volumes[:-2]) > 1.5:
                         if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 1800):
-                            conf = check_acaba_onaylı(symbol)
-                            send_telegram(f"🤔 *ACABA?* #{symbol}\n• Hacim: {round(ratio,1)}x\n• Analiz: {conf}")
+                            send_telegram(f"🤔 *ACABA?* #{symbol}\nHacim patladı, takibe al.")
                             sent_dict[symbol] = time.time()
             except: continue
         time.sleep(180)
