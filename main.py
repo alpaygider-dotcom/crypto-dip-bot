@@ -19,21 +19,34 @@ def get_pairs():
 def get_klines(symbol, limit):
     return requests.get(f"{BINANCE_SPOT}/api/v3/klines", params={"symbol": symbol, "interval": "5m", "limit": limit}).json()
 
-def check_zırhlı(symbol, klines):
-    # Zırhlı kriterler: Hacim patlaması + Dipte olma + Fiyatın çok şişmemiş olması
+def check_zırhlı_tam(symbol, klines):
+    # 1. Filtre: Hacim Patlaması (2.3x)
     volumes = [float(k[5]) for k in klines]
-    avg_vol = mean(volumes[:-2])
-    if avg_vol == 0: return False
+    if mean(volumes[:-2]) == 0: return False
+    ratio = volumes[-1] / mean(volumes[:-2])
     
-    ratio = volumes[-1] / avg_vol
+    # 2. Filtre: Fiyat aşırı şişmemiş mi? (Son 20dk değişim < %5)
     closes = [float(k[4]) for k in klines]
+    pump_check = ((closes[-1] - closes[-4]) / closes[-4]) < 0.05
     
-    # Kriter: 2.3x Hacim ve son 20dk pump yapmamış olması
-    return ratio > 2.3 and ((closes[-1] - closes[-4]) / closes[-4]) < 0.05
+    # 3. Filtre: 10M$ Hacim şartı (24 saatlik)
+    ticker = requests.get(f"{BINANCE_SPOT}/api/v3/ticker/24hr", params={"symbol": symbol}).json()
+    daily_vol = float(ticker.get("quoteVolume", 0))
+    
+    return ratio > 2.3 and pump_check and daily_vol > 10000000
+
+def check_acaba_onaylı(symbol):
+    # OI (Açık Pozisyon) kontrolü - Sadece Futures için
+    try:
+        oi = requests.get(f"{BINANCE_FUTURES}/futures/data/openInterestHist", params={"symbol": symbol, "period": "5m", "limit": 2}).json()
+        if len(oi) >= 2 and float(oi[1]["sumOpenInterest"]) > float(oi[0]["sumOpenInterest"]):
+            return "✅ ONAYLI (Balina girişi)"
+        return "⚠️ ONAYLANMADI"
+    except: return "❓ OI Verisi Yok"
 
 def main():
-    print("🚀 ÇİFT KATMANLI TARAMA AKTİF...")
     sent_dict = {}
+    print("🚀 GÜÇLENDİRİLMİŞ TARAMA BAŞLADI...")
     
     while True:
         pairs = get_pairs()
@@ -42,21 +55,21 @@ def main():
                 klines = get_klines(symbol, 20)
                 if len(klines) < 20: continue
                 
-                # 1. ZIRHLI SİNYAL KONTROLÜ
-                if check_zırhlı(symbol, klines):
+                # ZIRHLI SİNYALİ
+                if check_zırhlı_tam(symbol, klines):
                     if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
-                        send_telegram(f"💎 *ZIRHLI SİNYAL!* #{symbol}\nKuralları tam karşıladı, hacim patladı ve dipte.")
+                        send_telegram(f"💎 *ZIRHLI SİNYAL!* #{symbol}\nKurallar tamam: 2.3x Hacim + 10M$ Likidite.")
                         sent_dict[symbol] = time.time()
-                        continue # Zırhlı yakaladıysa Acaba'ya bakma
-
-                # 2. ACABA? GÖZCÜSÜ (Hacim var ama Zırhlı kriterine tam uymuyor)
-                volumes = [float(k[5]) for k in klines]
-                ratio = volumes[-1] / mean(volumes[:-2])
-                if ratio > 1.5:
-                    if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 1800):
-                        send_telegram(f"🤔 *ACABA?* #{symbol}\nHacim {round(ratio,1)}x arttı, takibe al.")
-                        sent_dict[symbol] = time.time()
-
+                
+                # ACABA SİNYALİ
+                else:
+                    volumes = [float(k[5]) for k in klines]
+                    ratio = volumes[-1] / mean(volumes[:-2])
+                    if ratio > 1.5:
+                        if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 1800):
+                            conf = check_acaba_onaylı(symbol)
+                            send_telegram(f"🤔 *ACABA?* #{symbol}\n• Hacim: {round(ratio,1)}x\n• Analiz: {conf}")
+                            sent_dict[symbol] = time.time()
             except: continue
         time.sleep(180)
 
