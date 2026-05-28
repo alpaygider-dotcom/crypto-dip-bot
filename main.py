@@ -2,8 +2,7 @@ import asyncio
 import aiohttp
 import os
 import time
-from statistics import mean
-from statistics import stdev
+from statistics import mean, stdev
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -31,6 +30,9 @@ COOLDOWN = 600
 
 last_signal = {}
 
+# ==========================================
+# TELEGRAM
+# ==========================================
 async def send_telegram(session, text):
 
     try:
@@ -51,6 +53,9 @@ async def send_telegram(session, text):
     except Exception as e:
         print("TELEGRAM ERROR:", e)
 
+# ==========================================
+# FETCH
+# ==========================================
 async def fetch_json(session, endpoint, params=None):
 
     try:
@@ -66,13 +71,14 @@ async def fetch_json(session, endpoint, params=None):
             if response.status != 200:
                 return None
 
-            data = await response.json()
-
-            return data
+            return await response.json()
 
     except:
         return None
 
+# ==========================================
+# REGIME
+# ==========================================
 def detect_regime(closes, volumes):
 
     move = (closes[-1] - closes[0]) / closes[0]
@@ -97,6 +103,9 @@ def detect_regime(closes, volumes):
 
     return "MIXED"
 
+# ==========================================
+# SWEEP
+# ==========================================
 def detect_sweep(highs, lows, closes):
 
     sweep_up = False
@@ -112,6 +121,9 @@ def detect_sweep(highs, lows, closes):
 
     return sweep_up, sweep_down
 
+# ==========================================
+# SIDEWAYS BREAKOUT
+# ==========================================
 def sideways_breakout(closes):
 
     recent = closes[-15:]
@@ -137,12 +149,16 @@ def sideways_breakout(closes):
 
     return compressed, breakout_up, breakout_down
 
+# ==========================================
+# HEAVY DATA
+# ==========================================
 async def get_heavy_data(session, symbol):
 
     funding = 0
     oi_change = 0
     long_short = 1
 
+    # FUNDING
     funding_data = await fetch_json(
         session,
         "/fapi/v1/premiumIndex",
@@ -157,6 +173,7 @@ async def get_heavy_data(session, symbol):
             )
         )
 
+    # OI
     oi_data = await fetch_json(
         session,
         "/futures/data/openInterestHist",
@@ -186,6 +203,7 @@ async def get_heavy_data(session, symbol):
                     / prev_oi
                 ) * 100
 
+    # LONG SHORT
     ratio_data = await fetch_json(
         session,
         "/futures/data/topLongShortPositionRatio",
@@ -209,6 +227,9 @@ async def get_heavy_data(session, symbol):
 
     return funding, oi_change, long_short
 
+# ==========================================
+# SCORE
+# ==========================================
 def calculate_score(
     change,
     taker_ratio,
@@ -227,48 +248,57 @@ def calculate_score(
     long_score = 0
     short_score = 0
 
+    # MOMENTUM
     if change > 1:
         long_score += 2
 
     if change < -1:
         short_score += 2
 
+    # TAKER
     if taker_ratio > 0.60:
         long_score += 2
 
     if taker_ratio < 0.40:
         short_score += 2
 
+    # VOLUME
     if vol_z > 2:
         long_score += 2
         short_score += 2
 
+    # TREND
     if regime == "TREND":
         long_score += 1
         short_score += 1
 
+    # SWEEP
     if sweep_down:
         long_score += 3
 
     if sweep_up:
         short_score += 3
 
+    # OI
     if oi_change > 3:
         long_score += 2
         short_score += 2
 
+    # FUNDING
     if funding < -0.01 and change > 0:
         long_score += 3
 
     if funding > 0.01 and change < 0:
         short_score += 3
 
+    # LONG SHORT
     if long_short > 1.5:
         short_score += 1
 
     if long_short < 0.7:
         long_score += 1
 
+    # BREAKOUT
     if compressed and breakout_up:
         long_score += 3
 
@@ -277,16 +307,25 @@ def calculate_score(
 
     return long_score, short_score
 
+# ==========================================
+# SIGNAL CLASS
+# ==========================================
 def classify_signal(score):
 
-    if score >= 11:
-        return "ZIRHLI"
+    if score >= 12:
+        return "🔥 GÜÇLÜ AL"
 
-    if score >= 7:
-        return "ACABA"
+    if score >= 8:
+        return "🟡 ORTA AL"
+
+    if score >= 6:
+        return "🟢 AZ AL"
 
     return None
 
+# ==========================================
+# SCAN COIN
+# ==========================================
 async def scan_coin(session, symbol):
 
     try:
@@ -350,6 +389,7 @@ async def scan_coin(session, symbol):
                 / vol_std
             )
 
+        # FAST FILTER
         if abs(change) < 0.4 and vol_z < 1.2:
             return
 
@@ -424,20 +464,53 @@ async def scan_coin(session, symbol):
         if direction == "SHORT":
             icon = "🔴"
 
+        expected_move = "%1-3"
+
+        if best_score >= 8:
+            expected_move = "%3-6"
+
+        if best_score >= 12:
+            expected_move = "%5-10"
+
+        reasons = []
+
+        if vol_z > 2:
+            reasons.append("Hacim Patlaması")
+
+        if oi_change > 3:
+            reasons.append("OI Yükselişi")
+
+        if funding < -0.01 and direction == "LONG":
+            reasons.append("Short Squeeze")
+
+        if funding > 0.01 and direction == "SHORT":
+            reasons.append("Long Squeeze")
+
+        if compressed:
+            reasons.append("Yatay Kırılım")
+
+        if sweep_down and direction == "LONG":
+            reasons.append("Dip Sweep")
+
+        if sweep_up and direction == "SHORT":
+            reasons.append("Tepe Sweep")
+
+        if len(reasons) == 0:
+            reasons.append("Momentum")
+
+        reason_text = ""
+
+        for r in reasons:
+            reason_text += "• " + r + "\n"
+
         msg = (
             signal_type + "\n\n" +
             icon + " " + symbol + "\n\n" +
-            "Direction: " + direction + "\n" +
-            "Score: " + str(best_score) + "\n" +
-            "Confidence: %" + str(confidence) + "\n\n" +
-            "Change: %" + str(round(change, 2)) + "\n" +
-            "Vol Z: " + str(round(vol_z, 2)) + "\n" +
-            "Taker: " + str(round(taker_ratio, 2)) + "\n" +
-            "OI Change: %" + str(round(oi_change, 2)) + "\n" +
-            "Funding: " + str(round(funding, 4)) + "\n" +
-            "Long/Short: " + str(round(long_short, 2)) + "\n" +
-            "Regime: " + regime + "\n" +
-            "Compression: " + str(compressed)
+            "Yön: " + direction + "\n" +
+            "Güven: %" + str(confidence) + "\n\n" +
+            "Tahmini Hareket: " + expected_move + "\n\n" +
+            "Sebep:\n" +
+            reason_text
         )
 
         print(msg)
@@ -451,15 +524,18 @@ async def scan_coin(session, symbol):
 
         print("SCAN ERROR:", symbol, e)
 
+# ==========================================
+# MAIN
+# ==========================================
 async def main():
 
-    print("BOT STARTED")
+    print("🚀 BOT STARTED")
 
     async with aiohttp.ClientSession() as session:
 
         await send_telegram(
             session,
-            "BOT ONLINE"
+            "✅ BOT ONLINE"
         )
 
         while True:
@@ -481,5 +557,8 @@ async def main():
                 SCAN_INTERVAL
             )
 
+# ==========================================
+# START
+# ==========================================
 if __name__ == "__main__":
     asyncio.run(main())
