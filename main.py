@@ -74,7 +74,7 @@ def main():
             time.sleep(60)
             continue
 
-        # 2. 24s TICKER VERİLERİNİ TEK SEFERDE ÇEK (Spot ve Vadeli için ayrı ayrı)
+        # 2. 24s TICKER VERİLERİNİ TEK SEFERDE ÇEK
         f_ticker_dict, s_ticker_dict = {}, {}
         try:
             f_tickers = requests.get(f"{FUTURES_URL}/fapi/v1/ticker/24hr", headers=HEADERS, timeout=4).json()
@@ -93,7 +93,6 @@ def main():
             try:
                 time.sleep(0.04) # API Rate Limit Dostu Gecikme
                 
-                # Coinin işlem gördüğü piyasaya göre baz URL ve veri havuzunu seç
                 if market_type == "Futures":
                     base_url = FUTURES_URL
                     endpoint = "/fapi/v1/klines"
@@ -156,7 +155,82 @@ def main():
                 # 💎 SINIF 1: ZIRHLI SİNYAL KONTROLÜ (YALNIZCA VADELİ PİYASA)
                 # --------------------------------------------------------
                 if market_type == "Futures" and ratio > 5.0 and quote_vol > 10000000:
-                    # 7 Günlük Gerçek Dip Kontrolü
+                    
+                    # 7 Günlük Gerçek Dip Kontrolü (Hatanın düzeltildiği yer 🛠️)
                     try:
                         res_7d = requests.get(f"{FUTURES_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1d", "limit": 7}, headers=HEADERS, timeout=4).json()
-                        if current_close > (max([float(k[2]) for k in res
+                        max_7d_high = max([float(k[2]) for k in res_7d])
+                        if current_close > (max_7d_high * 0.85):
+                            continue
+                    except:
+                        continue
+
+                    # Open Interest Kontrolü
+                    try:
+                        oi_res = requests.get(f"{FUTURES_URL}/fapi/v1/openInterestHist", params={"symbol": symbol, "period": "5m", "limit": 2}, headers=HEADERS, timeout=3).json()
+                        if len(oi_res) >= 2:
+                            prev_oi = float(oi_res[0]['sumOpenInterest'])
+                            curr_oi = float(oi_res[1]['sumOpenInterest'])
+                            oi_change = ((curr_oi - prev_oi) / prev_oi) * 100 if prev_oi > 0 else 0
+                            if oi_change < 1.5:
+                                continue
+                        else:
+                            continue
+                    except:
+                        continue
+
+                    # Funding Rate Kontrolü
+                    try:
+                        funding_res = requests.get(f"{FUTURES_URL}/fapi/v1/premiumIndex", params={"symbol": symbol}, headers=HEADERS, timeout=3).json()
+                        funding_rate = float(funding_res.get('lastFundingRate', 0))
+                        if funding_rate > 0.015:
+                            continue
+                    except:
+                        continue
+
+                    # L/S Divergansı
+                    try:
+                        ls_res = requests.get(f"{FUTURES_URL}/futures/data/globalLongShortAccountRatio", params={"symbol": symbol, "period": "5m", "limit": 2}, headers=HEADERS, timeout=3).json()
+                        if len(ls_res) >= 2 and float(ls_res[1]['longAccount']) < float(ls_res[0]['longAccount']):
+                            score += 1
+                    except:
+                        pass
+                    
+                    score += 1
+                    stars = "⭐" * score
+
+                    if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
+                        send_telegram(f"💎 *ZIRHLI VADELİ SİNYAL* #{symbol}\n\n"
+                                      f"• *Güven Skoru:* {stars}\n"
+                                      f"• Hacim Patlaması: {round(ratio,1)}x (Vadeli)\n"
+                                      f"• Para Girişi (OI): +%{round(oi_change,2)}\n"
+                                      f"• Fonlama Oranı: %{round(funding_rate*100,3)}\n"
+                                      f"• Durum: 7 Günlük Dipte Sıkışma Kırılımı\n"
+                                      f"• Detay: Küçük Yatırımcı Eleniyor (L/S Düşüşü)")
+                        sent_dict[symbol] = time.time()
+                        continue
+
+                # --------------------------------------------------------
+                # 🤔 SINIF 2: ACABA SİNYALİ KONTROLÜ (HEM SPOT HEM VADELİ)
+                # --------------------------------------------------------
+                if ratio > 3.0 and quote_vol > 1000000:
+                    if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
+                        if ratio > 5.0:
+                            stars += "⭐"
+                        
+                        send_telegram(f"🤔 *ACABA HİBRİT SİNYALİ* #{symbol}\n\n"
+                                      f"• *Güven Skoru:* {stars}\n"
+                                      f"• *Kaynak Piyasa:* {market_type}\n"
+                                      f"• Hacim Patlaması: {round(ratio,1)}x\n"
+                                      f"• Konum: Dip Bölgesi Gerçek Alıcı Baskısı\n"
+                                      f"• Not: Sabırlı Akümülasyondan Çıkış")
+                        sent_dict[symbol] = time.time()
+
+            except:
+                pass
+
+        print(f"[{time.strftime('%H:%M:%S')}] Tarama başarıyla bitti. 60 sn bekleniyor...")
+        time.sleep(60)
+
+if __name__ == "__main__":
+    main()
