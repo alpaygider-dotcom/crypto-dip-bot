@@ -17,9 +17,9 @@ MAX_CONCURRENT_REQUESTS = 20
 
 last_signal = {}
 
-# ------------------------------------------------------------
-# Telegram
-# ------------------------------------------------------------
+# ==================================================
+# TELEGRAM
+# ==================================================
 async def send_telegram(session, text):
     try:
         if not BOT_TOKEN or not CHAT_ID:
@@ -31,9 +31,9 @@ async def send_telegram(session, text):
     except Exception as e:
         print("TELEGRAM ERROR:", e)
 
-# ------------------------------------------------------------
-# Fetch (sadece futures base URL)
-# ------------------------------------------------------------
+# ==================================================
+# FETCH
+# ==================================================
 async def fetch_json(session, endpoint, params=None):
     try:
         url = BASE_URL + endpoint
@@ -44,9 +44,9 @@ async def fetch_json(session, endpoint, params=None):
     except:
         return None
 
-# ------------------------------------------------------------
+# ==================================================
 # EMA
-# ------------------------------------------------------------
+# ==================================================
 def ema(values, period):
     if len(values) < period:
         return None
@@ -56,9 +56,26 @@ def ema(values, period):
         ema_value = ((price - ema_value) * multiplier) + ema_value
     return ema_value
 
-# ------------------------------------------------------------
-# BTC Bias
-# ------------------------------------------------------------
+# ==================================================
+# ATR (Average True Range)
+# ==================================================
+def calculate_atr(highs, lows, closes, period=14):
+    if len(highs) < period + 1:
+        return None
+    tr_list = []
+    for i in range(1, len(highs)):
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i-1]),
+                 abs(lows[i] - closes[i-1]))
+        tr_list.append(tr)
+    if len(tr_list) < period:
+        return None
+    atr = mean(tr_list[-period:])
+    return atr
+
+# ==================================================
+# BTC BIAS
+# ==================================================
 async def get_btc_bias(session):
     klines = await fetch_json(session, "/fapi/v1/klines",
                               {"symbol": "BTCUSDT", "interval": "15m", "limit": 50})
@@ -75,9 +92,9 @@ async def get_btc_bias(session):
             return "BEARISH"
     return "NEUTRAL"
 
-# ------------------------------------------------------------
-# Regime
-# ------------------------------------------------------------
+# ==================================================
+# REGIME
+# ==================================================
 def detect_regime(closes, volumes):
     move = (closes[-1] - closes[0]) / closes[0]
     vol_mean = mean(volumes)
@@ -89,9 +106,9 @@ def detect_regime(closes, volumes):
         return "TREND"
     return "MIXED"
 
-# ------------------------------------------------------------
-# Sweep
-# ------------------------------------------------------------
+# ==================================================
+# SWEEP
+# ==================================================
 def detect_sweep(highs, lows, closes):
     sweep_up = False
     sweep_down = False
@@ -101,9 +118,9 @@ def detect_sweep(highs, lows, closes):
         sweep_down = True
     return sweep_up, sweep_down
 
-# ------------------------------------------------------------
-# Sideways Breakout
-# ------------------------------------------------------------
+# ==================================================
+# SIDEWAYS BREAKOUT
+# ==================================================
 def sideways_breakout(closes):
     recent = closes[-15:]
     highest = max(recent)
@@ -114,9 +131,9 @@ def sideways_breakout(closes):
     compressed = range_pct < 2.5
     return compressed, breakout_up, breakout_down
 
-# ------------------------------------------------------------
-# Orderflow + CVD
-# ------------------------------------------------------------
+# ==================================================
+# ORDERFLOW + CVD
+# ==================================================
 def orderflow_strength(volume, taker_buy, historical_taker_buys=None, historical_volumes=None):
     if volume <= 0:
         return 0, 0
@@ -151,9 +168,9 @@ def orderflow_strength(volume, taker_buy, historical_taker_buys=None, historical
             elif cvd_trend < 0: score -= 2
     return score, cvd_trend
 
-# ------------------------------------------------------------
-# Likidasyon (Coinglass)
-# ------------------------------------------------------------
+# ==================================================
+# LIKIDASYON (COINGLASS)
+# ==================================================
 async def get_liquidation_data(session, symbol):
     if not COINGLASS_API_KEY:
         return None, None
@@ -174,9 +191,9 @@ async def get_liquidation_data(session, symbol):
         pass
     return None, None
 
-# ------------------------------------------------------------
-# Adaptif Volatilite
-# ------------------------------------------------------------
+# ==================================================
+# ADAPTIF VOLATILITE
+# ==================================================
 def calc_volatility_factor(closes):
     if len(closes) < 20:
         return 1.0
@@ -186,9 +203,9 @@ def calc_volatility_factor(closes):
     factor = vol / base_vol if base_vol > 0 else 1
     return min(max(factor, 0.7), 1.4)
 
-# ------------------------------------------------------------
-# Heavy Data
-# ------------------------------------------------------------
+# ==================================================
+# HEAVY DATA
+# ==================================================
 async def get_heavy_data(session, symbol):
     funding = 0
     oi_change = 0
@@ -212,9 +229,9 @@ async def get_heavy_data(session, symbol):
             pass
     return funding, oi_change, long_short
 
-# ------------------------------------------------------------
-# Sinyal Sınıflandırma
-# ------------------------------------------------------------
+# ==================================================
+# SINIFLANDIRMA (ADAPTIF)
+# ==================================================
 def classify_signal(score, vol_factor=1.0):
     strong = max(13 * vol_factor, 10)
     medium = max(8 * vol_factor, 6)
@@ -227,9 +244,9 @@ def classify_signal(score, vol_factor=1.0):
         return "🟢 AZ AL"
     return None
 
-# ------------------------------------------------------------
-# Sadece Vadeli USDT Perp Sembolleri (~200 coin)
-# ------------------------------------------------------------
+# ==================================================
+# SEMBOL LISTESI (SADECE FUTURES USDT PERP)
+# ==================================================
 async def get_all_symbols(session):
     futures_symbols = []
     try:
@@ -242,9 +259,9 @@ async def get_all_symbols(session):
         pass
     return futures_symbols
 
-# ------------------------------------------------------------
-# Coin Tarama (sadece futures)
-# ------------------------------------------------------------
+# ==================================================
+# COIN TARAMA (POZISYON ÖNERISI ILE)
+# ==================================================
 async def scan_coin(session, symbol, btc_bias, semaphore):
     async with semaphore:
         try:
@@ -291,7 +308,6 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
 
             order_score, cvd_trend = orderflow_strength(volume, taker_buy, taker_buys, volumes)
 
-            # 1H Trend
             trend_bonus_long = 0
             trend_bonus_short = 0
             if klines_1h:
@@ -380,6 +396,32 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
             if best_score >= 8: expected_move = "%3-6"
             if best_score >= 13: expected_move = "%5-10"
 
+            # ----- ATR ve pozisyon önerisi -----
+            atr_val = calculate_atr(highs, lows, closes)
+            if atr_val is None:
+                atr_val = close_price * 0.005  # fallback %0.5
+
+            # Stop-loss mesafesi (ATR cinsinden)
+            sl_atr_mult = 1.5
+            tp_atr_mult = 2.0
+            if direction == "LONG":
+                stop_loss_price = close_price - atr_val * sl_atr_mult
+                take_profit_price = close_price + atr_val * tp_atr_mult
+            else:
+                stop_loss_price = close_price + atr_val * sl_atr_mult
+                take_profit_price = close_price - atr_val * tp_atr_mult
+
+            # Pozisyon büyüklüğü önerisi (sermaye: 1000 USDT, risk %1)
+            capital = 1000.0
+            risk_percent = 0.01
+            risk_amount = capital * risk_percent
+            stop_loss_pct = abs(close_price - stop_loss_price) / close_price
+            if stop_loss_pct > 0:
+                position_size = risk_amount / (stop_loss_pct * close_price)
+            else:
+                position_size = 0.0
+
+            # Sebep listesi
             reasons = []
             if vol_z > 2: reasons.append("Hacim Patlaması")
             if oi_change > 4: reasons.append("OI Yükselişi")
@@ -399,27 +441,39 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
             if len(reasons) == 0: reasons.append("Momentum")
 
             reason_text = "\n".join("• " + r for r in reasons)
-            msg = (f"{signal_type}\n\n{icon} {symbol}\n\n"
-                   f"Yön: {direction}\nGüven: %{confidence}\n\n"
-                   f"Tahmini Hareket: {expected_move}\n\n"
-                   f"Sebep:\n{reason_text}")
+
+            msg = (
+                f"{signal_type}\n\n"
+                f"{icon} {symbol}\n\n"
+                f"Yön: {direction}\n"
+                f"Güven: %{confidence}\n\n"
+                f"📊 Risk Yönetimi (örnek 1000 USDT):\n"
+                f"Stop‑Loss: {stop_loss_price:.4f} USDT\n"
+                f"Take‑Profit: {take_profit_price:.4f} USDT\n"
+                f"Pozisyon Büyüklüğü: {position_size:.2f} adet\n\n"
+                f"Tahmini Hareket: {expected_move}\n\n"
+                f"Sebep:\n{reason_text}"
+            )
             print(msg)
             await send_telegram(session, msg)
 
         except Exception as e:
             print("SCAN ERROR:", symbol, e)
 
-# ------------------------------------------------------------
-# Backtest (basit)
-# ------------------------------------------------------------
+# ==================================================
+# GERÇEKÇI BACKTEST (KOMISYON + KAYMA + ATR STOP)
+# ==================================================
 async def run_backtest(session):
     try:
-        await send_telegram(session, "📊 BACKTEST BAŞLATILIYOR... (son 3 gün)")
+        await send_telegram(session, "📊 GERÇEKÇİ BACKTEST BAŞLATILIYOR... (son 3 gün)")
         total_signals = 0
         wins = 0
         total_pnl = 0.0
+        total_pnl_net = 0.0
 
-        # Yalnızca futures coinler üzerinde, ilk 50'lik dilimde test
+        commission = 0.0004  # %0.04 taker fee
+        slippage = 0.0002    # %0.02 kayma
+
         all_syms = await get_all_symbols(session)
         test_symbols = []
         for sym in all_syms[:50]:
@@ -480,51 +534,73 @@ async def run_backtest(session):
 
                 direction = "LONG" if long_score > short_score else "SHORT"
                 entry = close_price
+
+                # ATR hesapla
+                atr_val = calculate_atr(highs, lows, closes)
+                if atr_val is None:
+                    atr_val = entry * 0.005
+
                 if direction == "LONG":
-                    tp = entry * 1.015
-                    sl = entry * 0.99
-                    future_prices = [float(k[4]) for k in klines[i+1:i+31]]
-                    for price in future_prices:
+                    tp = entry + atr_val * 2.0
+                    sl = entry - atr_val * 1.5
+                else:
+                    tp = entry - atr_val * 2.0
+                    sl = entry + atr_val * 1.5
+
+                # Komisyon ve kayma ile düzeltilmiş giriş
+                if direction == "LONG":
+                    entry_real = entry * (1 + slippage + commission)
+                else:
+                    entry_real = entry * (1 - slippage - commission)
+
+                future_prices = [float(k[4]) for k in klines[i+1:i+31]]
+                exit_price = None
+                for price in future_prices:
+                    if direction == "LONG":
                         if price >= tp:
+                            exit_price = tp * (1 - commission - slippage)  # çıkışta da komisyon
                             wins += 1
-                            total_pnl += 1.5
                             break
                         elif price <= sl:
-                            total_pnl -= 1.0
+                            exit_price = sl * (1 - commission - slippage)
                             break
-                else:
-                    tp = entry * 0.985
-                    sl = entry * 1.01
-                    future_prices = [float(k[4]) for k in klines[i+1:i+31]]
-                    for price in future_prices:
+                    else:
                         if price <= tp:
+                            exit_price = tp * (1 - commission - slippage)
                             wins += 1
-                            total_pnl += 1.5
                             break
                         elif price >= sl:
-                            total_pnl -= 1.0
+                            exit_price = sl * (1 - commission - slippage)
                             break
+                if exit_price is None:
+                    exit_price = entry_real  # zaman aşımı, başa baş
+
+                pnl = (exit_price - entry_real) / entry_real * 100
+                total_pnl_net += pnl
                 total_signals += 1
 
         win_rate = (wins / total_signals * 100) if total_signals > 0 else 0
-        avg_pnl = total_pnl / total_signals if total_signals > 0 else 0
-        msg = (f"📊 BACKTEST SONUCU (Son 3 gün)\n"
+        avg_pnl = total_pnl_net / total_signals if total_signals > 0 else 0
+        profit_factor = (total_pnl_net + wins) / (abs(total_pnl_net) + (total_signals - wins)) if total_signals > 0 else 0
+
+        msg = (f"📊 GERÇEKÇİ BACKTEST (Komisyon+Kaysa+ATR)\n"
                f"Toplam Sinyal: {total_signals}\n"
                f"Kazanan: {wins} | Kaybeden: {total_signals - wins}\n"
                f"Win Rate: %{win_rate:.1f}\n"
-               f"Ort. Getiri: %{avg_pnl:.2f}\n"
-               f"Kümülatif PnL: %{total_pnl:.2f}")
+               f"Ort. Net Getiri: %{avg_pnl:.2f}\n"
+               f"Kümülatif Net PnL: %{total_pnl_net:.2f}\n"
+               f"Kâr Faktörü: {profit_factor:.2f}")
         await send_telegram(session, msg)
     except Exception as e:
         print("Backtest Error:", e)
 
-# ------------------------------------------------------------
-# Ana döngü
-# ------------------------------------------------------------
+# ==================================================
+# ANA DÖNGÜ
+# ==================================================
 async def main():
-    print("🚀 PROFESSIONAL BOT STARTED (200 Futures Coins)")
+    print("🚀 PROFESIONAL BOT (200 Coin + Risk Yönetimi)")
     async with aiohttp.ClientSession() as session:
-        await send_telegram(session, "✅ BOT ONLINE (Sadece Vadeli USDT Perp)")
+        await send_telegram(session, "✅ BOT ONLINE (Sadece Vadeli USDT)")
         all_symbols = await get_all_symbols(session)
         print(f"Toplam futures coin: {len(all_symbols)}")
 
