@@ -4,15 +4,15 @@ import os
 import time
 from statistics import mean, stdev
 
-# =====================================================
+# =====================================
 # ENV
-# =====================================================
+# =====================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# =====================================================
+# =====================================
 # CONFIG
-# =====================================================
+# =====================================
 BASE_URL = "https://fapi.binance.com"
 
 COINS = [
@@ -34,14 +34,14 @@ INTERVAL = "5m"
 SCAN_INTERVAL = 40
 COOLDOWN = 600
 
-# =====================================================
+# =====================================
 # GLOBALS
-# =====================================================
+# =====================================
 last_signal = {}
 
-# =====================================================
+# =====================================
 # TELEGRAM
-# =====================================================
+# =====================================
 async def send_telegram(session, text):
 
     try:
@@ -57,26 +57,19 @@ async def send_telegram(session, text):
             "text": text
         }
 
-        await session.post(
-            url,
-            json=payload
-        )
+        await session.post(url, json=payload)
 
     except Exception as e:
         print("TELEGRAM ERROR:", e)
 
-# =====================================================
+# =====================================
 # FETCH
-# =====================================================
-async def fetch_json(
-    session,
-    endpoint,
-    params=None
-):
+# =====================================
+async def fetch_json(session, endpoint, params=None):
 
     try:
 
-        url = f"{BASE_URL}{endpoint}"
+        url = BASE_URL + endpoint
 
         async with session.get(
             url,
@@ -89,32 +82,24 @@ async def fetch_json(
 
             return await response.json()
 
-    except:
+    except Exception:
         return None
 
-# =====================================================
-# MARKET REGIME
-# =====================================================
-def detect_regime(
-    closes,
-    volumes
-):
+# =====================================
+# REGIME
+# =====================================
+def detect_regime(closes, volumes):
 
-    move = (
-        closes[-1] - closes[0]
-    ) / closes[0]
+    move = (closes[-1] - closes[0]) / closes[0]
 
     vol_mean = mean(volumes)
 
-    vol_std = (
-        stdev(volumes)
-        if len(volumes) > 1 else 0
-    )
+    vol_std = stdev(volumes) if len(volumes) > 1 else 0
 
-    vol_z = (
-        (volumes[-1] - vol_mean) / vol_std
-        if vol_std > 0 else 0
-    )
+    vol_z = 0
+
+    if vol_std > 0:
+        vol_z = (volumes[-1] - vol_mean) / vol_std
 
     if abs(move) < 0.004:
         return "RANGE"
@@ -124,14 +109,10 @@ def detect_regime(
 
     return "MIXED"
 
-# =====================================================
-# LIQUIDITY SWEEP
-# =====================================================
-def detect_sweep(
-    highs,
-    lows,
-    closes
-):
+# =====================================
+# SWEEP
+# =====================================
+def detect_sweep(highs, lows, closes):
 
     sweep_up = (
         highs[-1] > max(highs[-10:-1])
@@ -145,9 +126,9 @@ def detect_sweep(
 
     return sweep_up, sweep_down
 
-# =====================================================
-# SIDEWAYS COMPRESSION
-# =====================================================
+# =====================================
+# SIDEWAYS
+# =====================================
 def sideways_breakout(closes):
 
     recent = closes[-15:]
@@ -155,32 +136,19 @@ def sideways_breakout(closes):
     highest = max(recent)
     lowest = min(recent)
 
-    range_pct = (
-        (highest - lowest)
-        / lowest
-    ) * 100
+    range_pct = ((highest - lowest) / lowest) * 100
 
-    breakout_up = (
-        closes[-1] > highest * 0.998
-    )
+    breakout_up = closes[-1] > highest * 0.998
+    breakout_down = closes[-1] < lowest * 1.002
 
-    breakout_down = (
-        closes[-1] < lowest * 1.002
-    )
+    compressed = range_pct < 2.5
 
-    return (
-        range_pct < 2.5,
-        breakout_up,
-        breakout_down
-    )
+    return compressed, breakout_up, breakout_down
 
-# =====================================================
+# =====================================
 # HEAVY DATA
-# =====================================================
-async def get_heavy_data(
-    session,
-    symbol
-):
+# =====================================
+async def get_heavy_data(session, symbol):
 
     funding = 0
     oi_change = 0
@@ -229,7 +197,7 @@ async def get_heavy_data(
                 / prev_oi
             ) * 100
 
-    # LONG SHORT RATIO
+    # LONG SHORT
     ratio_data = await fetch_json(
         session,
         "/futures/data/topLongShortPositionRatio",
@@ -251,9 +219,9 @@ async def get_heavy_data(
 
     return funding, oi_change, long_short
 
-# =====================================================
-# SCORE ENGINE
-# =====================================================
+# =====================================
+# SCORE
+# =====================================
 def calculate_score(
     change,
     taker_ratio,
@@ -279,14 +247,14 @@ def calculate_score(
     if change < -1:
         short_score += 2
 
-    # TAKER PRESSURE
+    # TAKER
     if taker_ratio > 0.60:
         long_score += 2
 
     if taker_ratio < 0.40:
         short_score += 2
 
-    # VOLUME ANOMALY
+    # VOLUME
     if vol_z > 2:
         long_score += 2
         short_score += 2
@@ -295,10 +263,6 @@ def calculate_score(
     if regime == "TREND":
         long_score += 1
         short_score += 1
-
-    if regime == "RANGE":
-        long_score -= 1
-        short_score -= 1
 
     # SWEEP
     if sweep_down:
@@ -312,21 +276,21 @@ def calculate_score(
         long_score += 2
         short_score += 2
 
-    # FUNDING SQUEEZE
+    # FUNDING
     if funding < -0.01 and change > 0:
         long_score += 3
 
     if funding > 0.01 and change < 0:
         short_score += 3
 
-    # LONG SHORT RATIO
+    # LONG SHORT
     if long_short > 1.5:
         short_score += 1
 
     if long_short < 0.7:
         long_score += 1
 
-    # SIDEWAYS BREAKOUT
+    # SIDEWAYS
     if compressed and breakout_up:
         long_score += 3
 
@@ -335,26 +299,23 @@ def calculate_score(
 
     return long_score, short_score
 
-# =====================================================
-# SIGNAL TYPE
-# =====================================================
+# =====================================
+# SIGNAL CLASS
+# =====================================
 def classify_signal(score):
 
     if score >= 11:
-        return "🛡️ ZIRHLI"
+        return "ZIRHLI"
 
     if score >= 7:
-        return "❓ ACABA"
+        return "ACABA"
 
     return None
 
-# =====================================================
+# =====================================
 # SCAN
-# =====================================================
-async def scan_coin(
-    session,
-    symbol
-):
+# =====================================
+async def scan_coin(session, symbol):
 
     try:
 
@@ -390,102 +351,15 @@ async def scan_coin(
             / open_price
         ) * 100
 
-        taker_ratio = (
-            taker_buy / volume
-            if volume > 0 else 0
-        )
+        taker_ratio = 0
+
+        if volume > 0:
+            taker_ratio = taker_buy / volume
 
         vol_mean = mean(volumes)
 
-        vol_std = (
-            stdev(volumes)
-            if len(volumes) > 1 else 0
-        )
+        vol_std = stdev(volumes) if len(volumes) > 1 else 0
 
-        vol_z = (
-            (volume - vol_mean)
-            / vol_std
-            if vol_std > 0 else 0
-        )
+        vol_z = 0
 
-        # FAST FILTER
-        if (
-            abs(change) < 0.4
-            and vol_z < 1.2
-        ):
-            return
-
-        regime = detect_regime(
-            closes,
-            volumes
-        )
-
-        sweep_up, sweep_down = detect_sweep(
-            highs,
-            lows,
-            closes
-        )
-
-        compressed, breakout_up, breakout_down = sideways_breakout(
-            closes
-        )
-
-        # HEAVY FILTER
-        funding, oi_change, long_short = await get_heavy_data(
-            session,
-            symbol
-        )
-
-        long_score, short_score = calculate_score(
-            change,
-            taker_ratio,
-            vol_z,
-            regime,
-            sweep_up,
-            sweep_down,
-            funding,
-            oi_change,
-            long_short,
-            compressed,
-            breakout_up,
-            breakout_down
-        )
-
-        best_score = max(
-            long_score,
-            short_score
-        )
-
-        signal_type = classify_signal(
-            best_score
-        )
-
-        if not signal_type:
-            return
-
-        direction = (
-            "LONG"
-            if long_score > short_score
-            else "SHORT"
-        )
-
-        now = time.time()
-
-        if symbol in last_signal:
-
-            if now - last_signal[symbol] < COOLDOWN:
-                return
-
-        last_signal[symbol] = now
-
-        confidence = min(
-            95,
-            int(best_score * 7)
-        )
-
-        msg = (
-            f"{signal_type}\n\n"
-            f"{'🟢' if direction=='LONG' else '🔴'} "
-            f"{symbol}\n\n"
-            f"Direction: {direction}\n"
-            f"Score: {
+        if vol_std > 0:
