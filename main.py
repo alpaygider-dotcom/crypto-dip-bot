@@ -56,16 +56,18 @@ async def send_telegram(text):
     await telegram_queue.put(text)
 
 # ==================================================
-# FETCH
+# FETCH (GELİŞMİŞ HATA LOGU + IPv4)
 # ==================================================
 async def fetch_json(session, endpoint, params=None):
     try:
         url = BASE_URL + endpoint
         async with session.get(url, params=params, timeout=10) as response:
             if response.status != 200:
+                logging.error(f"HTTP {response.status} for {url}")
                 return None
             return await response.json()
-    except:
+    except Exception:
+        logging.exception(f"Fetch failed: {endpoint}")
         return None
 
 # ==================================================
@@ -493,30 +495,27 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
             print("SCAN ERROR:", symbol, e)
 
 # ==================================================
-# BACKTEST (DEBUG EKLENDİ)
+# BACKTEST (DEBUGLU)
 # ==================================================
 async def run_backtest(session):
     try:
         await send_telegram("📊 BACKTEST BAŞLATILIYOR...")
 
-        # ---------- DEBUG: API testi ----------
+        # API erişim testi
         test_kl = await fetch_json(session, "/fapi/v1/klines",
                                    {"symbol": "BTCUSDT", "interval": "5m", "limit": 5})
         if test_kl is None:
-            await send_telegram("❌ HATA: fetch_json() hiç veri çekemedi! (None döndü)")
+            await send_telegram("❌ fetch_json() başarısız, logları kontrol et.")
         else:
-            await send_telegram(f"✅ API çalışıyor. BTCUSDT 5m son mum fiyatı: {float(test_kl[-1][4])}")
+            await send_telegram(f"✅ API çalışıyor. BTCUSDT: {float(test_kl[-1][4])}")
 
-        # ---------- Sembol listesi ----------
         all_syms = await get_all_symbols(session)
         await send_telegram(f"📋 Toplam futures sembol: {len(all_syms)}")
-
         if len(all_syms) == 0:
-            await send_telegram("❌ Sembol listesi boş! Bot duracak.")
+            await send_telegram("❌ Sembol listesi boş!")
             return
 
         test_symbols = all_syms[:200]
-
         total_signals = 0
         wins = 0
         total_pnl_net = 0.0
@@ -524,7 +523,6 @@ async def run_backtest(session):
         commission = 0.0004
         slippage = 0.0002
 
-        first_coin_checked = False
         for symbol in test_symbols:
             klines = await fetch_json(session, "/fapi/v1/klines",
                                       {"symbol": symbol, "interval": "5m", "limit": 1000})
@@ -549,11 +547,6 @@ async def run_backtest(session):
                 volume = float(last[5])
                 taker_buy = float(last[9])
                 change = ((close_price - open_price) / open_price) * 100
-
-                # ---------- DEBUG: ilk coin ilk birkaç değer ----------
-                if not first_coin_checked and i == 200:
-                    await send_telegram(f"🔍 {symbol} | change: {change:.3f}% | vol: {volume:.2f}")
-                    first_coin_checked = True
 
                 if volume <= 0:
                     continue
@@ -640,14 +633,13 @@ async def run_backtest(session):
                 total_signals += 1
                 sym_signals += 1
 
-            # Her coin sonucu konsola (Telegram'a değil, süre olmasın diye)
             print(f"{symbol}: {sym_signals} sinyal")
 
         win_rate = (wins / total_signals * 100) if total_signals > 0 else 0
         avg_pnl = total_pnl_net / total_signals if total_signals > 0 else 0
         profit_factor = (total_pnl_net + wins) / (abs(total_pnl_net) + (total_signals - wins)) if total_signals > 0 else 0
 
-        msg = (f"📊 BACKTEST SONUCU (debug)\n"
+        msg = (f"📊 BACKTEST SONUCU\n"
                f"Toplam Sinyal: {total_signals}\n"
                f"Kazanan: {wins} | Kaybeden: {total_signals - wins}\n"
                f"Win Rate: %{win_rate:.1f}\n"
@@ -661,13 +653,26 @@ async def run_backtest(session):
         print("Backtest Error:", e)
 
 # ==================================================
-# ANA DÖNGÜ
+# ANA DÖNGÜ (IPv4 connector ile)
 # ==================================================
 async def main():
-    print("🚀 PROFESIONAL BOT (Backtest Debug)")
-    async with aiohttp.ClientSession() as session:
+    print("🚀 BOT BAŞLIYOR (IPv4 zorlamalı)")
+    connector = aiohttp.TCPConnector(family=2)  # 2 = AF_INET (IPv4)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # Telegram worker'ı aynı session ile başlat
         asyncio.create_task(telegram_worker(session))
-        await send_telegram("✅ BOT ONLINE (Debug modunda)")
+        await send_telegram("✅ BOT ONLINE")
+
+        # Bağlantı testi: Binance ping
+        try:
+            async with session.get("https://api.binance.com/api/v3/ping", timeout=10) as resp:
+                if resp.status == 200:
+                    await send_telegram("🌐 Binance ping başarılı")
+                else:
+                    await send_telegram(f"⚠️ Ping başarısız: HTTP {resp.status}")
+        except Exception as e:
+            await send_telegram(f"❌ Ping hatası: {str(e)}")
+
         all_symbols = await get_all_symbols(session)
         print(f"Toplam futures coin: {len(all_symbols)}")
 
