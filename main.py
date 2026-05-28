@@ -18,18 +18,33 @@ MAX_CONCURRENT_REQUESTS = 20
 last_signal = {}
 
 # ==================================================
-# TELEGRAM
+# TELEGRAM QUEUE (Spam koruması)
 # ==================================================
-async def send_telegram(session, text):
-    try:
-        if not BOT_TOKEN or not CHAT_ID:
-            print(text)
-            return
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": text}
-        await session.post(url, json=payload)
-    except Exception as e:
-        print("TELEGRAM ERROR:", e)
+telegram_queue = asyncio.Queue()
+
+async def telegram_worker(session):
+    while True:
+        text = await telegram_queue.get()
+        try:
+            if not BOT_TOKEN or not CHAT_ID:
+                print(text)
+            else:
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+                payload = {"chat_id": CHAT_ID, "text": text}
+                async with session.post(url, json=payload, timeout=10) as resp:
+                    if resp.status == 429:
+                        # Rate limit aşımı -> biraz bekle ve tekrar kuyruğa ekle
+                        await asyncio.sleep(1)
+                        await telegram_queue.put(text)
+        except Exception as e:
+            print("TELEGRAM ERROR:", e)
+        finally:
+            telegram_queue.task_done()
+        # Saniyede max 3 mesaj
+        await asyncio.sleep(0.35)
+
+async def send_telegram(text):
+    await telegram_queue.put(text)
 
 # ==================================================
 # FETCH
@@ -57,7 +72,7 @@ def ema(values, period):
     return ema_value
 
 # ==================================================
-# ATR (Average True Range)
+# ATR
 # ==================================================
 def calculate_atr(highs, lows, closes, period=14):
     if len(highs) < period + 1:
@@ -119,15 +134,20 @@ def detect_sweep(highs, lows, closes):
     return sweep_up, sweep_down
 
 # ==================================================
-# SIDEWAYS BREAKOUT
+# SIDEWAYS BREAKOUT (ATR dinamik eşik)
 # ==================================================
-def sideways_breakout(closes):
+def sideways_breakout(closes, atr_val=None):
     recent = closes[-15:]
     highest = max(recent)
     lowest = min(recent)
     range_pct = ((highest - lowest) / lowest) * 100
-    breakout_up = closes[-1] > highest * 0.998
-    breakout_down = closes[-1] < lowest * 1.002
+    # ATR varsa dinamik çarpan, yoksa sabit 0.002
+    if atr_val and highest > 0:
+        factor = (atr_val / highest) * 2  # ATR'ye göre esneklik
+    else:
+        factor = 0.002
+    breakout_up = closes[-1] > highest * (1 - factor)
+    breakout_down = closes[-1] < lowest * (1 + factor)
     compressed = range_pct < 2.5
     return compressed, breakout_up, breakout_down
 
@@ -260,7 +280,7 @@ async def get_all_symbols(session):
     return futures_symbols
 
 # ==================================================
-# COIN TARAMA (POZISYON ÖNERISI ILE)
+# COIN TARAMA (CANLI)
 # ==================================================
 async def scan_coin(session, symbol, btc_bias, semaphore):
     async with semaphore:
@@ -301,7 +321,13 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
 
             regime = detect_regime(closes, volumes)
             sweep_up, sweep_down = detect_sweep(highs, lows, closes)
-            compressed, breakout_up, breakout_down = sideways_breakout(closes)
+
+            # ATR değerini hesapla (sideways breakout için lazım)
+            atr_val = calculate_atr(highs, lows, closes)
+            if atr_val is None:
+                atr_val = close_price * 0.005
+
+            compressed, breakout_up, breakout_down = sideways_breakout(closes, atr_val)
 
             funding, oi_change, long_short = await get_heavy_data(session, symbol)
             long_liq, short_liq = await get_liquidation_data(session, symbol)
@@ -396,12 +422,7 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
             if best_score >= 8: expected_move = "%3-6"
             if best_score >= 13: expected_move = "%5-10"
 
-            # ----- ATR ve pozisyon önerisi -----
-            atr_val = calculate_atr(highs, lows, closes)
-            if atr_val is None:
-                atr_val = close_price * 0.005  # fallback %0.5
-
-            # Stop-loss mesafesi (ATR cinsinden)
+            # ATR ve pozisyon önerisi (aynı ATR kullanılıyor)
             sl_atr_mult = 1.5
             tp_atr_mult = 2.0
             if direction == "LONG":
@@ -411,7 +432,6 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
                 stop_loss_price = close_price + atr_val * sl_atr_mult
                 take_profit_price = close_price - atr_val * tp_atr_mult
 
-            # Pozisyon büyüklüğü önerisi (sermaye: 1000 USDT, risk %1)
             capital = 1000.0
             risk_percent = 0.01
             risk_amount = capital * risk_percent
@@ -421,7 +441,6 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
             else:
                 position_size = 0.0
 
-            # Sebep listesi
             reasons = []
             if vol_z > 2: reasons.append("Hacim Patlaması")
             if oi_change > 4: reasons.append("OI Yükselişi")
@@ -455,61 +474,65 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
                 f"Sebep:\n{reason_text}"
             )
             print(msg)
-            await send_telegram(session, msg)
+            await send_telegram(msg)
 
         except Exception as e:
             print("SCAN ERROR:", symbol, e)
 
 # ==================================================
-# GERÇEKÇI BACKTEST (KOMISYON + KAYMA + ATR STOP)
+# GERÇEKÇİ BACKTEST (200 coin, esnek filtre, optimize)
 # ==================================================
 async def run_backtest(session):
     try:
-        await send_telegram(session, "📊 GERÇEKÇİ BACKTEST BAŞLATILIYOR... (son 3 gün)")
+        await send_telegram("📊 GERÇEKÇİ BACKTEST BAŞLATILIYOR... (son 3 gün, esnek filtreler)")
         total_signals = 0
         wins = 0
-        total_pnl = 0.0
         total_pnl_net = 0.0
 
-        commission = 0.0004  # %0.04 taker fee
-        slippage = 0.0002    # %0.02 kayma
+        commission = 0.0004
+        slippage = 0.0002
 
         all_syms = await get_all_symbols(session)
-        test_symbols = []
-        for sym in all_syms[:50]:
-            k = await fetch_json(session, "/fapi/v1/klines", {"symbol": sym, "interval": "5m", "limit": 1})
-            if k is not None:
-                test_symbols.append(sym)
+        test_symbols = all_syms[:200]
 
         for symbol in test_symbols:
             klines = await fetch_json(session, "/fapi/v1/klines",
                                       {"symbol": symbol, "interval": "5m", "limit": 1000})
             if not klines or len(klines) < 50:
                 continue
+            # Son 200 mumdan itibaren başla, kayan pencere 50 mum
             for i in range(200, len(klines)-1):
-                recent = klines[:i+1]
-                closes = [float(k[4]) for k in recent]
-                highs = [float(k[2]) for k in recent]
-                lows = [float(k[3]) for k in recent]
-                volumes = [float(k[5]) for k in recent]
-                taker_buys = [float(k[9]) for k in recent]
-                last = recent[-1]
+                # Sadece son 50 mumu al (hız optimizasyonu)
+                window = klines[i-49:i+1] if i >= 49 else klines[:i+1]
+                closes = [float(k[4]) for k in window]
+                highs = [float(k[2]) for k in window]
+                lows = [float(k[3]) for k in window]
+                volumes = [float(k[5]) for k in window]
+                taker_buys = [float(k[9]) for k in window]
+                last = window[-1]
                 open_price = float(last[1])
                 close_price = float(last[4])
                 volume = float(last[5])
                 taker_buy = float(last[9])
                 change = ((close_price - open_price) / open_price) * 100
+
+                if len(volumes) < 10:
+                    continue
                 vol_mean = mean(volumes)
                 vol_std = stdev(volumes) if len(volumes) > 1 else 0
                 vol_z = ((volume - vol_mean) / vol_std) if vol_std > 0 else 0
 
+                # EŞİKLER DÜŞÜRÜLDÜ
+                if abs(change) < 0.15 and vol_z < 0.5:
+                    continue
+
                 regime = detect_regime(closes, volumes)
                 sweep_up, sweep_down = detect_sweep(highs, lows, closes)
-                compressed, breakout_up, breakout_down = sideways_breakout(closes)
 
-                vol_factor = calc_volatility_factor(closes)
-                if abs(change) < 0.25*vol_factor and vol_z < 0.8*vol_factor:
-                    continue
+                atr_val = calculate_atr(highs, lows, closes)
+                if atr_val is None:
+                    atr_val = close_price * 0.005
+                compressed, breakout_up, breakout_down = sideways_breakout(closes, atr_val)
 
                 order_score, cvd_trend = orderflow_strength(volume, taker_buy, taker_buys, volumes)
 
@@ -517,7 +540,7 @@ async def run_backtest(session):
                 short_score = 0
                 if change > 1: long_score += 2
                 if change < -1: short_score += 2
-                if vol_z > 2*vol_factor: long_score += 2; short_score += 2
+                if vol_z > 2: long_score += 2; short_score += 2
                 if regime == "TREND": long_score += 1; short_score += 1
                 if sweep_down: long_score += 3
                 if sweep_up: short_score += 3
@@ -529,16 +552,11 @@ async def run_backtest(session):
                 if cvd_trend < 0: short_score += 2
 
                 best_score = max(long_score, short_score)
-                signal_type = classify_signal(best_score, vol_factor)
+                signal_type = classify_signal(best_score, 0.8)
                 if not signal_type: continue
 
                 direction = "LONG" if long_score > short_score else "SHORT"
                 entry = close_price
-
-                # ATR hesapla
-                atr_val = calculate_atr(highs, lows, closes)
-                if atr_val is None:
-                    atr_val = entry * 0.005
 
                 if direction == "LONG":
                     tp = entry + atr_val * 2.0
@@ -547,7 +565,6 @@ async def run_backtest(session):
                     tp = entry - atr_val * 2.0
                     sl = entry + atr_val * 1.5
 
-                # Komisyon ve kayma ile düzeltilmiş giriş
                 if direction == "LONG":
                     entry_real = entry * (1 + slippage + commission)
                 else:
@@ -558,7 +575,7 @@ async def run_backtest(session):
                 for price in future_prices:
                     if direction == "LONG":
                         if price >= tp:
-                            exit_price = tp * (1 - commission - slippage)  # çıkışta da komisyon
+                            exit_price = tp * (1 - commission - slippage)
                             wins += 1
                             break
                         elif price <= sl:
@@ -573,7 +590,7 @@ async def run_backtest(session):
                             exit_price = sl * (1 - commission - slippage)
                             break
                 if exit_price is None:
-                    exit_price = entry_real  # zaman aşımı, başa baş
+                    exit_price = entry_real
 
                 pnl = (exit_price - entry_real) / entry_real * 100
                 total_pnl_net += pnl
@@ -583,14 +600,14 @@ async def run_backtest(session):
         avg_pnl = total_pnl_net / total_signals if total_signals > 0 else 0
         profit_factor = (total_pnl_net + wins) / (abs(total_pnl_net) + (total_signals - wins)) if total_signals > 0 else 0
 
-        msg = (f"📊 GERÇEKÇİ BACKTEST (Komisyon+Kaysa+ATR)\n"
+        msg = (f"📊 GERÇEKÇİ BACKTEST (200 coin, esnek filtre)\n"
                f"Toplam Sinyal: {total_signals}\n"
                f"Kazanan: {wins} | Kaybeden: {total_signals - wins}\n"
                f"Win Rate: %{win_rate:.1f}\n"
                f"Ort. Net Getiri: %{avg_pnl:.2f}\n"
                f"Kümülatif Net PnL: %{total_pnl_net:.2f}\n"
                f"Kâr Faktörü: {profit_factor:.2f}")
-        await send_telegram(session, msg)
+        await send_telegram(msg)
     except Exception as e:
         print("Backtest Error:", e)
 
@@ -598,9 +615,11 @@ async def run_backtest(session):
 # ANA DÖNGÜ
 # ==================================================
 async def main():
-    print("🚀 PROFESIONAL BOT (200 Coin + Risk Yönetimi)")
+    print("🚀 PROFESIONAL BOT (200 Coin + Telegram Queue + ATR Dinamik)")
     async with aiohttp.ClientSession() as session:
-        await send_telegram(session, "✅ BOT ONLINE (Sadece Vadeli USDT)")
+        # Telegram worker başlat
+        asyncio.create_task(telegram_worker(session))
+        await send_telegram("✅ BOT ONLINE (Sadece Vadeli USDT)")
         all_symbols = await get_all_symbols(session)
         print(f"Toplam futures coin: {len(all_symbols)}")
 
