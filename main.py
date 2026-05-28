@@ -24,9 +24,9 @@ SPOT_URL = "https://api.binance.com"
 
 CACHE_DURATION = 180
 COOLDOWN = 600
-MAX_POSSIBLE_SCORE = 28  # Bu skor sistemindeki maksimum puan
+MAX_POSSIBLE_SCORE = 28
 
-SEMAPHORE = asyncio.Semaphore(15)  # Rate limit koruması
+SEMAPHORE = asyncio.Semaphore(15)
 
 # =========================================================
 # CACHE & HAFIZA
@@ -36,7 +36,7 @@ last_signals = {}
 signal_memory = {}
 
 # =========================================================
-# TELEGRAM (COMPACT PROFESSIONAL ALERT)
+# TELEGRAM
 # =========================================================
 async def send_telegram(session, coin, signal_type):
     try:
@@ -58,7 +58,7 @@ async def send_telegram(session, coin, signal_type):
         print(f"Telegram hatası: {e}")
 
 # =========================================================
-# API & CACHE & EMA & ATR (Senin yazdığın güzel fonksiyonlar)
+# API
 # =========================================================
 async def fetch(session, url_type, endpoint, params=None):
     base = FAPI_URL if url_type == "fapi" else SPOT_URL
@@ -67,15 +67,17 @@ async def fetch(session, url_type, endpoint, params=None):
             async with session.get(f"{base}{endpoint}", params=params, timeout=10) as resp:
                 if resp.status != 200: return None
                 return await resp.json()
-    except: return None
+    except:
+        return None
 
 async def get_cached(session, cache_name, symbol, endpoint, params):
     now = time.time()
     if symbol in cache[cache_name]:
-        item = cache[cache_name][symbol]
-        if now - item["time"] < CACHE_DURATION: return item["data"]
+        if now - cache[cache_name][symbol]["time"] < CACHE_DURATION:
+            return cache[cache_name][symbol]["data"]
     data = await fetch(session, "fapi", endpoint, params)
-    if data: cache[cache_name][symbol] = {"time": now, "data": data}
+    if data:
+        cache[cache_name][symbol] = {"time": now, "data": data}
     return data
 
 def calculate_ema(prices, period):
@@ -87,9 +89,8 @@ def calculate_ema(prices, period):
 
 async def get_atr(session, symbol, period=14):
     now = time.time()
-    if symbol in cache["atr"]:
-        if now - cache["atr"][symbol]["time"] < 60:
-            return cache["atr"][symbol]["data"]
+    if symbol in cache["atr"] and now - cache["atr"][symbol]["time"] < 60:
+        return cache["atr"][symbol]["data"]
     klines = await fetch(session, "fapi", "/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": period + 1})
     if not klines: return 0.001
     tr_values = []
@@ -99,29 +100,6 @@ async def get_atr(session, symbol, period=14):
     atr = mean(tr_values) if tr_values else 0.001
     cache["atr"][symbol] = {"time": now, "data": atr}
     return atr
-
-# =========================================================
-# BTC MARKET FILTER
-# =========================================================
-async def btc_market_safe(session):
-    btc_klines = await fetch(session, "fapi", "/fapi/v1/klines", {"symbol": "BTCUSDT", "interval": "15m", "limit": 50})
-    if not btc_klines: return False
-    last = btc_klines[-2]
-    change_pct = ((float(last[4]) - float(last[1])) / float(last[1])) * 100
-    closes = [float(k[4]) for k in btc_klines]
-    ema20, ema50 = calculate_ema(closes, 20), calculate_ema(closes, 50)
-    if ema20 and ema50 and ema20 < ema50: print("⚠️ BTC Bearish Trend"); return False
-    highs, lows = [float(k[2]) for k in btc_klines[-10:]], [float(k[3]) for k in btc_klines[-10:]]
-    volatility = ((max(highs) - min(lows)) / min(lows)) * 100
-    if change_pct < -2: print("⚠️ BTC Dump"); return False
-    if volatility > 4: print("⚠️ BTC Volatility High"); return False
-    ethbtc = await fetch(session, "spot", "/api/v3/klines", {"symbol": "ETHBTC", "interval": "15m", "limit": 2})
-    if ethbtc:
-        try:
-            if ((float(ethbtc[-1][4]) - float(ethbtc[-1][1])) / float(ethbtc[-1][1])) * 100 < -0.8:
-                print("⚠️ ETHBTC Weak"); return False
-        except: pass
-    return True
 
 # =========================================================
 # ORDERBOOK & TOP TRADER & RISK
@@ -147,7 +125,7 @@ def estimate_liquidation_risk(change_pct, oi_change):
     return "LOW"
 
 # =========================================================
-# SCAN COIN (WHALE & SQUEEZE LOGIC + CONFIDENCE DAHİL)
+# SCAN COIN
 # =========================================================
 async def scan_coin(session, symbol, market_median, min_score_atr):
     try:
@@ -212,7 +190,7 @@ async def scan_coin(session, symbol, market_median, min_score_atr):
         atr_percent = (atr_val / close_price) * 100 if close_price > 0 else 0
         normalized_change = change_pct / atr_percent if atr_percent > 0 else 0
 
-        # ===== SKOR SİSTEMİ (WHALE & SQUEEZE LOGIC DAHİL) =====
+        # SKOR SİSTEMİ
         long_score, short_score = 0, 0
         squeeze = False
 
@@ -227,7 +205,7 @@ async def scan_coin(session, symbol, market_median, min_score_atr):
         if change_pct > 0: long_score += 1
         else: short_score += 1
 
-        # WHALE MOMENTUM DETECTION (ANORMAL OI ARTIŞI veya TAKER BUY)
+        # WHALE MOMENTUM DETECTION
         if oi_change > 10: long_score += 3; short_score += 3
         if taker_ratio > 0.65: long_score += 2
 
@@ -264,7 +242,7 @@ async def scan_coin(session, symbol, market_median, min_score_atr):
             result = {"symbol": symbol, "direction": "SHORT", "score": short_score, "confidence": confidence,
                       "price": round(close_price, 4), "change": round(change_pct, 2), "oi": round(oi_change, 2),
                       "funding": round(funding_rate, 6), "delta": round(delta_ratio, 3), "rel_vol": round(rel_vol, 2),
-                      "trend": "Bearish", "risk": estimate_liquidation_risk(change_pct, oi_change), "squeeze": False} # Short squeeze var ama long için
+                      "trend": "Bearish", "risk": estimate_liquidation_risk(change_pct, oi_change), "squeeze": False}
 
         if result: last_signals[symbol] = time.time()
         return result
@@ -273,20 +251,18 @@ async def scan_coin(session, symbol, market_median, min_score_atr):
         return None
 
 # =========================================================
-# MAIN (RAILWAY OPTIMIZED LOOP)
+# MAIN (Market Unsafe FİLTRESİ TAMAMEN KALDIRILDI)
 # =========================================================
 async def main():
-    print("🚀 ULTRA SCANNER (FINAL - ALL FEATURES) BAŞLATILDI")
+    print("🚀 ULTRA SCANNER (FINAL - NO MARKET FILTER) BAŞLATILDI")
     connector = aiohttp.TCPConnector(limit=100)
     async with aiohttp.ClientSession(connector=connector) as session:
         while True:
             try:
                 print(f"\n--- {datetime.now().strftime('%H:%M:%S')} ---")
 
-                if not await btc_market_safe(session):
-                    print("⚠️ Market unsafe")
-                    await asyncio.sleep(30)
-                    continue
+                # ---> BURASI ÖNEMLİ: `btc_market_safe` KONTROLÜ TAMAMEN KALDIRILDI <---
+                # Bot artık her döngüde doğrudan taramaya geçiyor.
 
                 # CLEANUP
                 now = time.time()
