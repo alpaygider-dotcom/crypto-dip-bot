@@ -2,7 +2,7 @@ import requests
 import time
 from statistics import mean
 
-# CREDENTIALS
+# AYARLAR
 BOT_TOKEN = "8728951395:AAHLIgnGKxddfAJFkfQxm8t0bsnTnAJNYZU"
 CHAT_ID = "6637406938"
 BINANCE_SPOT = "https://api.binance.com"
@@ -16,13 +16,9 @@ def send_telegram(msg):
 
 def get_pairs():
     try:
-        response = requests.get(f"{BINANCE_SPOT}/api/v3/exchangeInfo", timeout=10)
-        data = response.json()
-        if "symbols" in data:
-            return [s["symbol"] for s in data["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
-        return []
-    except:
-        return []
+        res = requests.get(f"{BINANCE_SPOT}/api/v3/exchangeInfo", timeout=10).json()
+        return [s["symbol"] for s in res["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
+    except: return []
 
 def get_klines(symbol):
     try:
@@ -32,26 +28,8 @@ def get_klines(symbol):
         return res.json() if res.status_code == 200 else []
     except: return []
 
-def check_zırhlı_tam(symbol, klines):
-    try:
-        volumes = [float(k[5]) for k in klines]
-        if len(volumes) < 20 or mean(volumes[:-2]) == 0: return False
-        ratio = volumes[-1] / mean(volumes[:-2])
-        
-        ticker = requests.get(f"{BINANCE_SPOT}/api/v3/ticker/24hr", params={"symbol": symbol}, timeout=5).json()
-        daily_vol = float(ticker.get("quoteVolume", 0))
-        
-        # LS Oranı
-        ls_res = requests.get(f"{BINANCE_FUTURES}/futures/data/globalLongShortAccountRatio", 
-                              params={"symbol": symbol, "period": "5m", "limit": 1}, timeout=5).json()
-        ls_ratio = float(ls_res[0]["longShortRatio"])
-        
-        return ratio > 2.3 and daily_vol > 10000000 and ls_ratio < 1.25
-    except: return False
-
 def main():
-    print("🚀 SİSTEM GÜVENLİ MODDA BAŞLADI...")
-    send_telegram("✅ Sistem güvenli modda başlatıldı.")
+    print("🚀 BOT BAŞLATILDI: ZIRHLI VE ACABA MODLARI AKTİF")
     sent_dict = {}
     
     while True:
@@ -65,23 +43,30 @@ def main():
                 klines = get_klines(symbol)
                 if len(klines) < 20: continue
                 
-                # Zırhlı Sinyal
-                if check_zırhlı_tam(symbol, klines):
+                volumes = [float(k[5]) for k in klines]
+                avg_vol = mean(volumes[:-2])
+                if avg_vol == 0: continue
+                ratio = volumes[-1] / avg_vol
+                
+                # ZIRHLI SİNYAL (KATI KURALLAR)
+                # 2.3x Hacim + 10M$ Likidite
+                ticker = requests.get(f"{BINANCE_SPOT}/api/v3/ticker/24hr", params={"symbol": symbol}, timeout=3).json()
+                daily_vol = float(ticker.get("quoteVolume", 0))
+                
+                if ratio > 2.3 and daily_vol > 10000000:
                     if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
-                        send_telegram(f"💎 *ZIRHLI SİNYAL!* #{symbol}\n• Hacim: 2.3x+\n• 10M$ Hacim onaylı.")
+                        send_telegram(f"💎 *ZIRHLI SİNYAL!* #{symbol}\n• Hacim: {round(ratio,1)}x\n• Likidite: 10M$+")
                         sent_dict[symbol] = time.time()
                 
-                #                 # ... (Zırhlı Sinyal kısmı aynı kalsın) ...
-                
-                # ACABA SİNYALİ (Filtreleri Gevşettik)
-                else:
-                    volumes = [float(k[5]) for k in klines]
-                    if volumes[-1] / mean(volumes[:-2]) > 1.3: # Hacim oranı 1.3'e düştü
-                        # Buradan daily_vol kontrolünü kaldırıyoruz ki her coin gelsin
-                        if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 1800):
-                            send_telegram(f"🤔 *ACABA?* #{symbol}\nHacim hareketlendi, takibe al.")
-                            sent_dict[symbol] = time.time()
-
+                # ACABA SİNYALİ (DAHA ESNEK)
+                # Sadece 1.3x hacim artışı yeterli, likidite şartı yok
+                elif ratio > 1.3:
+                    if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 1800):
+                        send_telegram(f"🤔 *ACABA?* #{symbol}\n• Hacim: {round(ratio,1)}x\n• Kıpırdanma tespit edildi.")
+                        sent_dict[symbol] = time.time()
+                        
+            except: continue
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
