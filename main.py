@@ -13,7 +13,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 COINGLASS_API_KEY = os.getenv("COINGLASS_API_KEY")
 
-BASE_URL = "https://fapi.binance.com"
+# 🌍 Binance global API (farklı IP, aynı endpoint'ler)
+BASE_URL = "https://api.binance.com"
 
 SCAN_INTERVAL = 40
 COOLDOWN = 600
@@ -69,7 +70,7 @@ async def send_telegram(text):
     await telegram_queue.put(text)
 
 # ==================================================
-# FETCH (orijinal)
+# FETCH
 # ==================================================
 async def fetch_json(session, endpoint, params=None):
     try:
@@ -276,7 +277,7 @@ async def get_all_symbols(session):
             if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
 
 # ==================================================
-# SCAN (HIBRIT)
+# SCAN
 # ==================================================
 async def scan_coin(session, symbol, btc_bias, sem):
     global trading_paused
@@ -318,7 +319,6 @@ async def scan_coin(session, symbol, btc_bias, sem):
 
             of_score, cvd_trend = orderflow_strength(vol, tbuy, tb, v)
 
-            # 1H trend bonus
             bonus_l = bonus_s = 0
             if kl_1h:
                 c1 = [float(k[4]) for k in kl_1h]
@@ -327,44 +327,35 @@ async def scan_coin(session, symbol, btc_bias, sem):
                     if c1[-1] > e20 > e50: bonus_l += 3
                     if c1[-1] < e20 < e50: bonus_s += 3
 
-            # SCORING (hibrit ağırlıklarla)
             long_score = 0
             short_score = 0
 
-            # trend ağırlığı
             if change > 1: long_score += 2 * weights["trend"]
             if change < -1: short_score += 2 * weights["trend"]
 
-            # volume
             if vz > 2 * vol_factor:
                 long_score += 2 * weights["volume"]
                 short_score += 2 * weights["volume"]
 
-            # regime
             if regime == "TREND":
                 long_score += 1 * weights["regime"]
                 short_score += 1 * weights["regime"]
 
-            # sweep
             if sw_down: long_score += 3 * weights["whale"]
             if sw_up: short_score += 3 * weights["whale"]
 
-            # OI, funding
             if oi_ch > 4:
                 long_score += 3
                 short_score += 3
             if funding < -0.01 and change > 0: long_score += 3
             if funding > 0.01 and change < 0: short_score += 3
 
-            # long/short ratio
             if ls > 1.5: short_score += 1
             if ls < 0.7: long_score += 1
 
-            # breakout
             if comp and break_up: long_score += 3 * weights["breakout"]
             if comp and break_down: short_score += 3 * weights["breakout"]
 
-            # orderflow & CVD
             if of_score > 0: long_score += of_score
             if of_score < 0: short_score += abs(of_score)
             if cvd_trend > 0: long_score += 2
@@ -373,11 +364,9 @@ async def scan_coin(session, symbol, btc_bias, sem):
             long_score += bonus_l
             short_score += bonus_s
 
-            # BTC bias
             if btc_bias == "BULLISH": long_score += 2; short_score -= 1
             if btc_bias == "BEARISH": short_score += 2; long_score -= 1
 
-            # liquidation
             if liq_l and liq_s:
                 if liq_l > liq_s * 1.3: long_score += 2
                 if liq_s > liq_l * 1.3: short_score += 2
@@ -395,12 +384,10 @@ async def scan_coin(session, symbol, btc_bias, sem):
             if symbol in last_signal and now - last_signal[symbol] < COOLDOWN: return
             last_signal[symbol] = now
 
-            # PnL simülasyonu (gerçekçi değil ama risk motoru için)
             pnl = (best - 10) * 0.5
             risk_engine(pnl)
             evolve(pnl)
 
-            # Stop/tp
             sl = close_p - atr_val * 1.5 if direction == "LONG" else close_p + atr_val * 1.5
             tp = close_p + atr_val * 2.0 if direction == "LONG" else close_p - atr_val * 2.0
 
@@ -412,12 +399,19 @@ async def scan_coin(session, symbol, btc_bias, sem):
             logging.error(f"SCAN {symbol}: {traceback.format_exc()}")
 
 # ==================================================
-# BACKTEST (esnek, CVD'li)
+# BACKTEST
 # ==================================================
 async def run_backtest(session):
     try:
-        await send_telegram("📊 BACKTEST BAŞLADI")
+        # Bağlantı testi
+        ping = await fetch_json(session, "/fapi/v1/ping")
+        if ping is not None:
+            await send_telegram("✅ API bağlantısı başarılı")
+        else:
+            await send_telegram("❌ API bağlantısı başarısız!")
+
         syms = await get_all_symbols(session)
+        await send_telegram(f"📋 {len(syms)} sembol bulundu")
         test = syms[:200]
         total = wins = 0
         pnl_net = 0.0
@@ -492,10 +486,10 @@ async def run_backtest(session):
 # MAIN
 # ==================================================
 async def main():
-    print("🚀 HİBRİT BOT BAŞLADI")
+    print("🚀 HİBRİT BOT (api.binance.com)")
     async with aiohttp.ClientSession() as session:
         asyncio.create_task(telegram_worker(session))
-        await send_telegram("✅ HİBRİT BOT ONLINE")
+        await send_telegram("✅ HİBRİT BOT ONLINE (api.binance.com)")
         syms = await get_all_symbols(session)
         print(f"{len(syms)} coin")
         sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
