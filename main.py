@@ -5,7 +5,6 @@ import time
 import logging
 import traceback
 from statistics import mean, stdev
-from datetime import datetime, timezone, timedelta
 
 # ==================================================
 # LOG AYARLARI
@@ -163,7 +162,7 @@ def sideways_breakout(closes, atr_val=None):
     return compressed, breakout_up, breakout_down
 
 # ==================================================
-# ORDERFLOW + CVD (gelişmiş)
+# ORDERFLOW + CVD
 # ==================================================
 def orderflow_strength(volume, taker_buy, historical_taker_buys=None, historical_volumes=None):
     if volume <= 0:
@@ -296,7 +295,7 @@ async def get_all_symbols(session):
     return futures_symbols
 
 # ==================================================
-# COIN TARAMA (CANLI)
+# COIN TARAMA (CANLI) – DOKUNMADIM
 # ==================================================
 async def scan_coin(session, symbol, btc_bias, semaphore):
     async with semaphore:
@@ -494,11 +493,30 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
             print("SCAN ERROR:", symbol, e)
 
 # ==================================================
-# BACKTEST (GERÇEK CVD + ÇOK DÜŞÜK EŞİK)
+# BACKTEST (DEBUG EKLENDİ)
 # ==================================================
 async def run_backtest(session):
     try:
-        await send_telegram("📊 BACKTEST BAŞLATILIYOR (çok düşük eşik, gerçek CVD)")
+        await send_telegram("📊 BACKTEST BAŞLATILIYOR...")
+
+        # ---------- DEBUG: API testi ----------
+        test_kl = await fetch_json(session, "/fapi/v1/klines",
+                                   {"symbol": "BTCUSDT", "interval": "5m", "limit": 5})
+        if test_kl is None:
+            await send_telegram("❌ HATA: fetch_json() hiç veri çekemedi! (None döndü)")
+        else:
+            await send_telegram(f"✅ API çalışıyor. BTCUSDT 5m son mum fiyatı: {float(test_kl[-1][4])}")
+
+        # ---------- Sembol listesi ----------
+        all_syms = await get_all_symbols(session)
+        await send_telegram(f"📋 Toplam futures sembol: {len(all_syms)}")
+
+        if len(all_syms) == 0:
+            await send_telegram("❌ Sembol listesi boş! Bot duracak.")
+            return
+
+        test_symbols = all_syms[:200]
+
         total_signals = 0
         wins = 0
         total_pnl_net = 0.0
@@ -506,10 +524,7 @@ async def run_backtest(session):
         commission = 0.0004
         slippage = 0.0002
 
-        all_syms = await get_all_symbols(session)
-        test_symbols = all_syms[:200]
-        print(f"Backtest için {len(test_symbols)} sembol alındı.")
-
+        first_coin_checked = False
         for symbol in test_symbols:
             klines = await fetch_json(session, "/fapi/v1/klines",
                                       {"symbol": symbol, "interval": "5m", "limit": 1000})
@@ -517,7 +532,6 @@ async def run_backtest(session):
                 continue
 
             sym_signals = 0
-            # Her adımda son 50 mumu al
             for i in range(200, len(klines)-1):
                 window = klines[i-49:i+1] if i >= 49 else klines[:i+1]
                 if len(window) < 30:
@@ -536,10 +550,14 @@ async def run_backtest(session):
                 taker_buy = float(last[9])
                 change = ((close_price - open_price) / open_price) * 100
 
+                # ---------- DEBUG: ilk coin ilk birkaç değer ----------
+                if not first_coin_checked and i == 200:
+                    await send_telegram(f"🔍 {symbol} | change: {change:.3f}% | vol: {volume:.2f}")
+                    first_coin_checked = True
+
                 if volume <= 0:
                     continue
 
-                # Basit filtre (neredeyse yok)
                 if abs(change) < 0.1:
                     continue
 
@@ -551,7 +569,6 @@ async def run_backtest(session):
                     atr_val = close_price * 0.005
                 compressed, breakout_up, breakout_down = sideways_breakout(closes, atr_val)
 
-                # GERÇEK CVD hesapla
                 order_score, cvd_trend = orderflow_strength(volume, taker_buy, taker_buys, volumes)
 
                 long_score = 0
@@ -577,7 +594,6 @@ async def run_backtest(session):
                     short_score += 1
 
                 best_score = max(long_score, short_score)
-                # Eşik çok düşük: vol_factor=0.2, floor yok → weak=1.0
                 signal_type = classify_signal(best_score, 0.2, use_floor=False)
                 if not signal_type:
                     continue
@@ -624,13 +640,14 @@ async def run_backtest(session):
                 total_signals += 1
                 sym_signals += 1
 
+            # Her coin sonucu konsola (Telegram'a değil, süre olmasın diye)
             print(f"{symbol}: {sym_signals} sinyal")
 
         win_rate = (wins / total_signals * 100) if total_signals > 0 else 0
         avg_pnl = total_pnl_net / total_signals if total_signals > 0 else 0
         profit_factor = (total_pnl_net + wins) / (abs(total_pnl_net) + (total_signals - wins)) if total_signals > 0 else 0
 
-        msg = (f"📊 BACKTEST SONUCU (200 coin, düşük eşik)\n"
+        msg = (f"📊 BACKTEST SONUCU (debug)\n"
                f"Toplam Sinyal: {total_signals}\n"
                f"Kazanan: {wins} | Kaybeden: {total_signals - wins}\n"
                f"Win Rate: %{win_rate:.1f}\n"
@@ -647,10 +664,10 @@ async def run_backtest(session):
 # ANA DÖNGÜ
 # ==================================================
 async def main():
-    print("🚀 PROFESIONAL BOT (CVD + Backtest düzeltildi)")
+    print("🚀 PROFESIONAL BOT (Backtest Debug)")
     async with aiohttp.ClientSession() as session:
         asyncio.create_task(telegram_worker(session))
-        await send_telegram("✅ BOT ONLINE (Backtest çalışıyor)")
+        await send_telegram("✅ BOT ONLINE (Debug modunda)")
         all_symbols = await get_all_symbols(session)
         print(f"Toplam futures coin: {len(all_symbols)}")
 
