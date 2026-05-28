@@ -6,13 +6,12 @@ from statistics import mean
 BOT_TOKEN = "8728951395:AAHLIgnGKxddfAJFkfQxm8t0bsnTnAJNYZU"
 CHAT_ID = "6637406938"
 
-# BİNANCE KİMLİK GİZLEME (Cloudflare engellerini aşmak için)
+# BİNANCE KİMLİK GİZLEME
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json"
 }
 
-# 1. Sırada limitsiz "Vision" veri sunucusu var, diğerleri yedek.
 BINANCE_MIRRORS = [
     "https://data-api.binance.vision",
     "https://api.binance.com",
@@ -30,7 +29,6 @@ def send_telegram(msg):
 def get_all_pairs_and_url():
     for base_url in BINANCE_MIRRORS:
         try:
-            # Maskeli İstek
             res = requests.get(f"{base_url}/api/v3/exchangeInfo", headers=HEADERS, timeout=5)
             if res.status_code == 200:
                 data = res.json()
@@ -42,7 +40,7 @@ def get_all_pairs_and_url():
     return [], None
 
 def main():
-    print("🚀 BOT BAŞLADI: KİMLİK GİZLEME + VİSİON SUNUCUSU AKTİF...")
+    print("🚀 BOT AKTİF: ACABA MODÜLÜNÜN FİLTRELERİ SIKILAŞTIRILDI...")
     sent_dict = {}
     
     while True:
@@ -53,11 +51,10 @@ def main():
             time.sleep(30)
             continue
             
-        print(f"\n[{time.strftime('%H:%M:%S')}] TOPLAM {len(pairs)} COIN TARANIYOR ({working_url})...")
+        print(f"\n[{time.strftime('%H:%M:%S')}] TOPLAM {len(pairs)} COIN DETAYLI SÜZGEÇTEN GEÇİYOR ({working_url})...")
         
         for symbol in pairs:
             try:
-                # Maskeli Klines İsteği
                 res = requests.get(f"{working_url}/api/v3/klines", 
                                    params={"symbol": symbol, "interval": "5m", "limit": 20}, 
                                    headers=HEADERS, timeout=4)
@@ -76,22 +73,22 @@ def main():
                 
                 ratio = volumes[-1] / avg_vol
                 
-                # 1. ZIRHLI SİNYAL (2.3x Hacim)
+                # 1. ZIRHLI SİNYAL (Değişmedi - Katı kural)
                 if ratio > 2.3:
                     if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
                         send_telegram(f"💎 *ZIRHLI SİNYAL!* #{symbol}\n• Hacim: {round(ratio,1)}x\n• Piyasa: Tüm Binance")
                         sent_dict[symbol] = time.time()
                 
-                # 2. ACABA SİNYALİ (1.3x Hacim)
-                elif ratio > 1.3:
-                    if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 1800):
+                # 2. ACABA SİNYALİ (Limit 1.3'ten 1.7'ye yükseltildi!)
+                elif ratio > 1.7:
+                    if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
                         send_telegram(f"🤔 *ACABA?* #{symbol}\n• Hacim: {round(ratio,1)}x\n• Piyasa: Tüm Binance")
                         sent_dict[symbol] = time.time()
                         
             except:
                 pass
             
-            time.sleep(0.1) # Hafif gecikme
+            time.sleep(0.1)
         
         print(f"[{time.strftime('%H:%M:%S')}] Tarama tamamlandı. 60 saniye dinleniliyor...")
         time.sleep(60)
