@@ -7,21 +7,17 @@ import traceback
 from statistics import mean, stdev
 
 # ==================================================
-# CONFIG (Ekran Görüntüsündeki Sabit Ayarlar)
+# CONFIG
 # ==================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "8728951395:AAHLiGnGKxddfAJFf..." 
-CHAT_ID = os.getenv("CHAT_ID") or "6637406398"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 COINGLASS_API_KEY = os.getenv("COINGLASS_API_KEY")
 
-# 🌍 Sabah tıkır tıkır çalışan doğru Vadeli İşlemler URL'si
 BASE_URL = "https://fapi.binance.com"
 
 SCAN_INTERVAL = 40
 COOLDOWN = 600
 MAX_CONCURRENT_REQUESTS = 20
-
-# 📋 Sabah saatlerinde kullandığın çalışan sabit coin listesi
-COIN_LIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT"]
 
 last_signal = {}
 
@@ -62,7 +58,10 @@ async def telegram_worker(session):
         try:
             if BOT_TOKEN and CHAT_ID:
                 url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-                await session.post(url, json={"chat_id": CHAT_ID, "text": text})
+                async with session.post(url, json={"chat_id": CHAT_ID, "text": text}) as resp:
+                    if resp.status == 429:
+                        await asyncio.sleep(1)
+                        await telegram_queue.put(text)
         except:
             pass
         finally:
@@ -73,20 +72,36 @@ async def send_telegram(text):
     await telegram_queue.put(text)
 
 # ==================================================
-# FETCH
+# FETCH (USER-AGENT + RETRY)
 # ==================================================
-async def fetch_json(session, endpoint, params=None):
-    try:
-        url = BASE_URL + endpoint
-        async with session.get(url, params=params, timeout=10) as resp:
-            if resp.status == 200:
-                return await resp.json()
-    except:
-        pass
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
+async def fetch_json(session, endpoint, params=None, max_retries=3):
+    url = BASE_URL + endpoint
+    for attempt in range(max_retries):
+        try:
+            async with session.get(url, params=params, headers=HEADERS, timeout=10) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                elif resp.status in (403, 451):
+                    logging.error(f"Blocked {resp.status} at {url}")
+                    return None
+                else:
+                    logging.error(f"HTTP {resp.status} for {url}")
+        except asyncio.TimeoutError:
+            logging.error(f"Timeout {endpoint}")
+        except Exception:
+            logging.exception(f"Fetch error {endpoint}")
+
+        if attempt < max_retries - 1:
+            await asyncio.sleep(2 ** attempt)
+
     return None
 
 # ==================================================
-# INDICATORS
+# INDICATORS (değişmedi)
 # ==================================================
 def ema(values, period):
     if len(values) < period:
@@ -192,17 +207,19 @@ async def get_liquidation_data(session, symbol):
     try:
         headers = {"coinglassSecret": COINGLASS_API_KEY}
         params = {"symbol": symbol.replace("USDT",""), "time_type": "1"}
-        async with aiohttp.ClientSession() as cs:
-            async with cs.get("https://open-api.coinglass.com/public/v2/liquidation",
-                              params=params, headers=headers, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("code") == "0":
-                        items = data["data"]["liquidationList"]
-                        long_liq = sum(float(it["longVolUsd"]) for it in items)
-                        short_liq = sum(float(it["shortVolUsd"]) for it in items)
-                        return long_liq, short_liq
-    except: pass
+        async with session.get(
+            "https://open-api.coinglass.com/public/v2/liquidation",
+            params=params, headers=headers, timeout=10
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get("code") == "0":
+                    items = data["data"]["liquidationList"]
+                    long_liq = sum(float(it["longVolUsd"]) for it in items)
+                    short_liq = sum(float(it["shortVolUsd"]) for it in items)
+                    return long_liq, short_liq
+    except:
+        pass
     return None, None
 
 # ==================================================
@@ -217,20 +234,28 @@ def calc_volatility_factor(closes):
     return min(max(factor, 0.7), 1.4)
 
 # ==================================================
-# CLASSIFY
+# CLASSIFY (ZIRHLI SİNYAL EKLENDİ)
 # ==================================================
 def classify_signal(score, vol_factor=1.0, use_floor=True):
     if use_floor:
+        armored = max(15 * vol_factor, 12)   # yeni zırhlı eşik
         strong = max(13 * vol_factor, 10)
         medium = max(8 * vol_factor, 6)
         weak = max(5 * vol_factor, 4)
     else:
+        armored = 15 * vol_factor
         strong = 13 * vol_factor
         medium = 8 * vol_factor
         weak = 5 * vol_factor
-    if score >= strong: return "🔥 GÜÇLÜ"
-    if score >= medium: return "🟡 ORTA"
-    if score >= weak: return "🟢 ZAYIF"
+
+    if score >= armored:
+        return "🛡️ ZIRHLI SİNYAL"
+    if score >= strong:
+        return "🔥 GÜÇLÜ"
+    if score >= medium:
+        return "🟡 ORTA"
+    if score >= weak:
+        return "🟢 ZAYIF"
     return None
 
 # ==================================================
@@ -271,7 +296,16 @@ async def get_btc_bias(session):
     return "NEUTRAL"
 
 # ==================================================
-# SCAN
+# SYMBOLS
+# ==================================================
+async def get_all_symbols(session):
+    info = await fetch_json(session, "/fapi/v1/exchangeInfo")
+    if not info: return []
+    return [s["symbol"] for s in info["symbols"]
+            if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
+
+# ==================================================
+# SCAN (ZIRHLI HIBRIT)
 # ==================================================
 async def scan_coin(session, symbol, btc_bias, sem):
     global trading_paused
@@ -387,28 +421,128 @@ async def scan_coin(session, symbol, btc_bias, sem):
 
             msg = f"{sig} {symbol} {direction}\nTP:{tp:.4f} SL:{sl:.4f}\nScore:{best}"
             print(msg)
-            await session.ensure_future(send_telegram(msg)) if hasattr(session, 'ensure_future') else await send_telegram(msg)
+            await send_telegram(msg)
 
         except Exception as e:
             logging.error(f"SCAN {symbol}: {traceback.format_exc()}")
 
 # ==================================================
-# MAIN
+# BACKTEST (ZIRHLI HIBRIT)
+# ==================================================
+async def run_backtest(session):
+    try:
+        await send_telegram("📊 BACKTEST BAŞLADI")
+        syms = await get_all_symbols(session)
+        if not syms:
+            await send_telegram("❌ Sembol listesi boş!")
+            return
+        await send_telegram(f"📋 {len(syms)} sembol bulundu")
+        test = syms[:200]
+        total = wins = 0
+        pnl_net = 0.0
+        comm = 0.0004; slip = 0.0002
+
+        for sym in test:
+            kl = await fetch_json(session, "/fapi/v1/klines",
+                                  {"symbol": sym, "interval": "5m", "limit": 1000})
+            if not kl or len(kl) < 50: continue
+            for i in range(200, len(kl)-1):
+                win = kl[i-49:i+1] if i >= 49 else kl[:i+1]
+                if len(win) < 30: continue
+                c = [float(k[4]) for k in win]; h = [float(k[2]) for k in win]
+                l = [float(k[3]) for k in win]; v = [float(k[5]) for k in win]
+                tb = [float(k[9]) for k in win]
+                last = win[-1]; op = float(last[1]); cp = float(last[4])
+                vol = float(last[5]); tbuy = float(last[9])
+                change = (cp - op) / op * 100
+                if vol <= 0 or abs(change) < 0.1: continue
+
+                regime = detect_regime(c, v)
+                sw_up, sw_down = detect_sweep(h, l, c)
+                atr_val = atr(h, l, c) or cp * 0.005
+                comp, bu, bd = sideways_breakout(c, atr_val)
+                of, cvd = orderflow_strength(vol, tbuy, tb, v)
+
+                long = short = 0
+                if change > 0.5: long += 1
+                if change < -0.5: short += 1
+                if sw_down: long += 2
+                if sw_up: short += 2
+                if comp and bu: long += 2
+                if comp and bd: short += 2
+                if of > 0: long += of
+                if of < 0: short += abs(of)
+                if cvd > 0: long += 1
+                if cvd < 0: short += 1
+                if regime == "TREND": long += 1; short += 1
+
+                best = max(long, short)
+                sig = classify_signal(best, 0.2, use_floor=False)
+                if not sig: continue
+
+                dir = "LONG" if long > short else "SHORT"
+                entry = cp
+                tp = entry + atr_val*2 if dir=="LONG" else entry - atr_val*2
+                sl = entry - atr_val*1.5 if dir=="LONG" else entry + atr_val*1.5
+                entry_real = entry * (1+slip+comm) if dir=="LONG" else entry * (1-slip-comm)
+                fut = [float(k[4]) for k in kl[i+1:i+31]]
+                exit_p = None
+                for p in fut:
+                    if dir=="LONG":
+                        if p >= tp: exit_p = tp*(1-comm-slip); wins += 1; break
+                        elif p <= sl: exit_p = sl*(1-comm-slip); break
+                    else:
+                        if p <= tp: exit_p = tp*(1-comm-slip); wins += 1; break
+                        elif p >= sl: exit_p = sl*(1-comm-slip); break
+                if exit_p is None: exit_p = entry_real
+                pnl_net += (exit_p - entry_real) / entry_real * 100
+                total += 1
+
+        winrate = wins/total*100 if total else 0
+        avg = pnl_net/total if total else 0
+        pf = (pnl_net+wins)/(abs(pnl_net)+(total-wins)) if total else 0
+        msg = (f"📊 BACKTEST\nSinyal:{total} Kazan:{wins} (%{winrate:.1f})\n"
+               f"Ort.PnL:%{avg:.2f} Küm.PnL:%{pnl_net:.2f} PF:{pf:.2f}")
+        await send_telegram(msg)
+    except Exception as e:
+        logging.error(f"Backtest: {traceback.format_exc()}")
+
+# ==================================================
+# MAIN (TEMIZ OTURUM)
 # ==================================================
 async def main():
-    print(f"🚀 HİBRİT BOT ONLINE ({BASE_URL})")
+    print("🚀 ZIRHLI HİBRİT BOT BAŞLATILDI")
     async with aiohttp.ClientSession() as session:
-        asyncio.create_task(telegram_worker(session))
-        await send_telegram("✅ HİBRİT BOT ONLINE")
-        
-        print(f"{len(COIN_LIST)} adet coin yükendi.")
+        worker = asyncio.create_task(telegram_worker(session))
+        await send_telegram("🛡️ ZIRHLI HİBRİT BOT ONLINE")
+
+        # Bağlantı testi
+        if await fetch_json(session, "/fapi/v1/ping") is not None:
+            await send_telegram("🌐 Binance bağlantısı başarılı")
+        else:
+            await send_telegram("⚠️ Bağlantı başarısız, ancak denemeye devam edilecek.")
+
+        syms = await get_all_symbols(session)
+        print(f"{len(syms)} coin")
         sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-        while True:
-            bias = await get_btc_bias(session)
-            tasks = [scan_coin(session, sym, bias, sem) for sym in COIN_LIST]
-            await asyncio.gather(*tasks)
-            await asyncio.sleep(SCAN_INTERVAL)
+        asyncio.create_task(run_backtest(session))
+        last_backtest = time.time()
+
+        try:
+            while True:
+                bias = await get_btc_bias(session)
+                tasks = [scan_coin(session, sym, bias, sem) for sym in syms]
+                await asyncio.gather(*tasks, return_exceptions=True)
+                if time.time() - last_backtest > 86400:
+                    asyncio.create_task(run_backtest(session))
+                    last_backtest = time.time()
+                await asyncio.sleep(SCAN_INTERVAL)
+        except asyncio.CancelledError:
+            print("Bot kapatılıyor...")
+        finally:
+            worker.cancel()
+            await worker
 
 if __name__ == "__main__":
     asyncio.run(main())
