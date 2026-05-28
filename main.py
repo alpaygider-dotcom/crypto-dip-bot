@@ -3,21 +3,16 @@ import aiohttp
 import os
 import time
 from statistics import mean, stdev
-from binance import AsyncClient
-from binance.enums import *
 
-# =========================================
+# ======================================
 # ENV
-# =========================================
+# ======================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-BINANCE_KEY = os.getenv("BINANCE_KEY")
-BINANCE_SECRET = os.getenv("BINANCE_SECRET")
-
-# =========================================
+# ======================================
 # CONFIG
-# =========================================
+# ======================================
 COINS = [
     "BTCUSDT",
     "ETHUSDT",
@@ -27,31 +22,30 @@ COINS = [
     "ADAUSDT"
 ]
 
+BASE_URL = "https://fapi.binance.com"
+
 INTERVAL = "5m"
 
-SCAN_INTERVAL = 20
+SCAN_INTERVAL = 30
 COOLDOWN = 300
 
-LEVERAGE = 5
-RISK_PER_TRADE = 0.01
-
-# FALSE = paper mode
-# TRUE = real trade
 USE_LIVE_TRADING = False
 
-# =========================================
+# ======================================
 # GLOBALS
-# =========================================
+# ======================================
 last_signal = {}
 
-# =========================================
+# ======================================
 # TELEGRAM
-# =========================================
+# ======================================
 async def send_telegram(session, text):
+
+    if not BOT_TOKEN or not CHAT_ID:
+        print(text)
+        return
+
     try:
-        if not BOT_TOKEN or not CHAT_ID:
-            print(text)
-            return
 
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
@@ -60,42 +54,90 @@ async def send_telegram(session, text):
             "text": text
         }
 
-        await session.post(url, json=payload)
+        await session.post(
+            url,
+            json=payload
+        )
 
     except Exception as e:
         print("Telegram Error:", e)
 
-# =========================================
-# MARKET REGIME
-# =========================================
-def detect_regime(closes, vols):
+# ======================================
+# FETCH KLINES
+# ======================================
+async def fetch_klines(
+    session,
+    symbol
+):
+
+    try:
+
+        url = f"{BASE_URL}/fapi/v1/klines"
+
+        params = {
+            "symbol": symbol,
+            "interval": INTERVAL,
+            "limit": 50
+        }
+
+        async with session.get(
+            url,
+            params=params,
+            timeout=10
+        ) as response:
+
+            if response.status != 200:
+                return None
+
+            return await response.json()
+
+    except Exception as e:
+        print("Fetch Error:", symbol, e)
+        return None
+
+# ======================================
+# REGIME
+# ======================================
+def detect_regime(
+    closes,
+    volumes
+):
 
     if len(closes) < 20:
         return "UNKNOWN"
 
-    ret = (closes[-1] - closes[0]) / closes[0]
+    move = (
+        closes[-1] - closes[0]
+    ) / closes[0]
 
-    vol_mean = mean(vols)
+    vol_mean = mean(volumes)
 
-    vol_std = stdev(vols) if len(vols) > 1 else 0
+    vol_std = (
+        stdev(volumes)
+        if len(volumes) > 1 else 0
+    )
 
     vol_z = (
-        (vols[-1] - vol_mean) / vol_std
+        (volumes[-1] - vol_mean) / vol_std
         if vol_std > 0 else 0
     )
 
-    if abs(ret) < 0.003:
+    if abs(move) < 0.003:
         return "RANGE"
 
-    if abs(ret) > 0.01 and vol_z > 1:
+    if abs(move) > 0.01 and vol_z > 1:
         return "TREND"
 
     return "MIXED"
 
-# =========================================
+# ======================================
 # LIQUIDITY SWEEP
-# =========================================
-def detect_sweep(highs, lows, closes):
+# ======================================
+def detect_sweep(
+    highs,
+    lows,
+    closes
+):
 
     sweep_up = (
         highs[-1] > max(highs[-10:-1])
@@ -109,9 +151,9 @@ def detect_sweep(highs, lows, closes):
 
     return sweep_up, sweep_down
 
-# =========================================
+# ======================================
 # SCORE ENGINE
-# =========================================
+# ======================================
 def calculate_score(
     change,
     taker_ratio,
@@ -151,7 +193,7 @@ def calculate_score(
         long_score -= 1
         short_score -= 1
 
-    # liquidity sweep
+    # liquidity
     if sweep_down:
         long_score += 3
 
@@ -160,74 +202,19 @@ def calculate_score(
 
     return long_score, short_score
 
-# =========================================
-# POSITION SIZE
-# =========================================
-def calculate_qty(balance, price):
-
-    risk_amount = balance * RISK_PER_TRADE
-
-    qty = (risk_amount * LEVERAGE) / price
-
-    return round(qty, 3)
-
-# =========================================
-# EXECUTE TRADE
-# =========================================
-async def execute_trade(
-    client,
-    symbol,
-    direction,
-    qty
-):
-
-    try:
-
-        if not USE_LIVE_TRADING:
-            print(f"[PAPER] {symbol} {direction}")
-            return True
-
-        side = (
-            SIDE_BUY
-            if direction == "LONG"
-            else SIDE_SELL
-        )
-
-        await client.futures_change_leverage(
-            symbol=symbol,
-            leverage=LEVERAGE
-        )
-
-        order = await client.futures_create_order(
-            symbol=symbol,
-            side=side,
-            type=FUTURE_ORDER_TYPE_MARKET,
-            quantity=qty
-        )
-
-        print(order)
-
-        return True
-
-    except Exception as e:
-        print("ORDER ERROR:", e)
-        return False
-
-# =========================================
+# ======================================
 # SCAN COIN
-# =========================================
+# ======================================
 async def scan_coin(
-    client,
     session,
     symbol
 ):
 
     try:
 
-        klines = await client.futures_klines(
-            symbol=symbol,
-            interval=INTERVAL,
-            limit=50
+        klines = await fetch_klines(
+            session,
+            symbol
         )
 
         if not klines:
@@ -236,7 +223,7 @@ async def scan_coin(
         closes = [float(k[4]) for k in klines]
         highs = [float(k[2]) for k in klines]
         lows = [float(k[3]) for k in klines]
-        vols = [float(k[5]) for k in klines]
+        volumes = [float(k[5]) for k in klines]
 
         last = klines[-2]
 
@@ -244,7 +231,6 @@ async def scan_coin(
         close_price = float(last[4])
 
         volume = float(last[5])
-
         taker_buy = float(last[9])
 
         change = (
@@ -257,11 +243,11 @@ async def scan_coin(
             if volume > 0 else 0
         )
 
-        vol_mean = mean(vols)
+        vol_mean = mean(volumes)
 
         vol_std = (
-            stdev(vols)
-            if len(vols) > 1 else 0
+            stdev(volumes)
+            if len(volumes) > 1 else 0
         )
 
         vol_z = (
@@ -271,7 +257,7 @@ async def scan_coin(
 
         regime = detect_regime(
             closes,
-            vols
+            volumes
         )
 
         sweep_up, sweep_down = detect_sweep(
@@ -312,23 +298,6 @@ async def scan_coin(
 
         last_signal[symbol] = now
 
-        fake_balance = 1000
-
-        qty = calculate_qty(
-            fake_balance,
-            close_price
-        )
-
-        ok = await execute_trade(
-            client,
-            symbol,
-            direction,
-            qty
-        )
-
-        if not ok:
-            return
-
         msg = (
             f"{'🟢' if direction == 'LONG' else '🔴'} "
             f"{symbol}\n"
@@ -337,7 +306,7 @@ async def scan_coin(
             f"Change: %{round(change,2)}\n"
             f"Vol Z: {round(vol_z,2)}\n"
             f"Regime: {regime}\n"
-            f"Qty: {qty}"
+            f"Mode: PAPER"
         )
 
         print(msg)
@@ -350,17 +319,12 @@ async def scan_coin(
     except Exception as e:
         print("SCAN ERROR:", symbol, e)
 
-# =========================================
+# ======================================
 # MAIN
-# =========================================
+# ======================================
 async def main():
 
-    print("🚀 FINAL AI BOT STARTED")
-
-    client = await AsyncClient.create(
-        BINANCE_KEY,
-        BINANCE_SECRET
-    )
+    print("🚀 BOT STARTED")
 
     async with aiohttp.ClientSession() as session:
 
@@ -368,7 +332,6 @@ async def main():
 
             tasks = [
                 scan_coin(
-                    client,
                     session,
                     coin
                 )
@@ -381,8 +344,8 @@ async def main():
                 SCAN_INTERVAL
             )
 
-# =========================================
+# ======================================
 # START
-# =========================================
+# ======================================
 if __name__ == "__main__":
     asyncio.run(main())
