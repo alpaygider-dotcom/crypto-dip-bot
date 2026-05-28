@@ -40,7 +40,7 @@ def get_all_pairs_and_url():
     return [], None
 
 def main():
-    print("🚀 BOT AKTİF: ACABA MODÜLÜNÜN FİLTRELERİ SIKILAŞTIRILDI...")
+    print("🚀 BOT YENİDEN AYARLANDI: SİNYAL HİYERARŞİSİ GÜNCELLENDİ...")
     sent_dict = {}
     
     while True:
@@ -73,16 +73,16 @@ def main():
                 
                 ratio = volumes[-1] / avg_vol
                 
-                # 1. ZIRHLI SİNYAL (Değişmedi - Katı kural)
-                if ratio > 2.3:
+                # 1. EN ÜST FİLTRE: ZIRHLI SİNYAL (Hacim 5 Katına Çıktıysa - Gerçek Pump/Balina)
+                if ratio > 5.0:
                     if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
-                        send_telegram(f"💎 *ZIRHLI SİNYAL!* #{symbol}\n• Hacim: {round(ratio,1)}x\n• Piyasa: Tüm Binance")
+                        send_telegram(f"💎 *ZIRHLI SİNYAL!* #{symbol}\n• Hacim: {round(ratio,1)}x\n• Durum: Olağanüstü Hacim Patlaması!")
                         sent_dict[symbol] = time.time()
                 
-                # 2. ACABA SİNYALİ (Limit 1.3'ten 1.7'ye yükseltildi!)
-                elif ratio > 1.7:
+                # 2. ARA FİLTRE: ACABA SİNYALİ (Hacim 3 ile 5 Kat Arasındaysa - Güçlü Trade Fırsatı)
+                elif ratio > 3.0:
                     if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
-                        send_telegram(f"🤔 *ACABA?* #{symbol}\n• Hacim: {round(ratio,1)}x\n• Piyasa: Tüm Binance")
+                        send_telegram(f"🤔 *ACABA?* #{symbol}\n• Hacim: {round(ratio,1)}x\n• Durum: Hacim Güçleniyor, Takibe Al!")
                         sent_dict[symbol] = time.time()
                         
             except:
