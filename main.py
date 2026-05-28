@@ -13,10 +13,9 @@ HEADERS = {
     "Accept": "application/json"
 }
 
-SPOT_URL = "https://api.binance.com"
 FUTURES_URL = "https://fapi.binance.com"
 
-# ESKİ ÇALIŞAN KODDAKİ GİBİ SABİT PARİTE LİSTEMİZ (Sunucuyu kilitlemez)
+# ASLA KİLİTLENMEYEN ESKİ STABİL PARİTE LİSTEMİZ
 COINS = [
     "1000LUNC", "1000SHIB", "1000XEC", "ADA", "AGLD", "APE", "APT", "AR", "ARB", "ARKM",
     "ATOM", "AVAX", "BANANA", "BCH", "BLUR", "BNB", "BONK", "CELO", "CRV", "CYBER",
@@ -36,11 +35,11 @@ def send_telegram(msg):
         pass
 
 def main():
-    print("🚀 SABİT LİSTE VE YENİ GÜÇLÜ FİLTRELERLE BOT BAŞLATILDI... 🚀")
+    print("🚀 BOT GÜVENLİ VE HAFİF MODDA BAŞLATILDI (YALNIZCA FUTURES VERİSİ) 🚀")
     sent_dict = {}
     
     while True:
-        print(f"\n[{time.strftime('%H:%M:%S')}] {len(COINS)} Parite Taranıyor...")
+        print(f"\n[{time.strftime('%H:%M:%S')}] {len(COINS)} Vadeli Parite Analiz Ediliyor...")
         
         # 1. BTC VADELİ HACİM KONTROLÜ (Piyasa Güvenliği)
         btc_is_pumping = False
@@ -53,35 +52,18 @@ def main():
             pass
 
         if btc_is_pumping:
-            print("⚠️ BTC tahtasında agresif hacim! Güvenlik için 1 dakika erteleniyor...")
+            print("⚠️ BTC tahtasında ani agresif hacim! Tarama 1 dk erteleniyor...")
             time.sleep(60)
             continue
 
-        # 2. 24s TICKER VERİLERİNİ TEK SEFERDE ÇEK (Piyasa Hacmi İçin tek istek)
-        f_ticker_dict = {}
-        try:
-            f_tickers = requests.get(f"{FUTURES_URL}/fapi/v1/ticker/24hr", headers=HEADERS, timeout=4).json()
-            for t in f_tickers:
-                f_ticker_dict[t['symbol']] = t
-        except:
-            print("⚠️ 24s Ticker verisi çekilemedi, bir sonraki döngüde denenecek.")
-            time.sleep(10)
-            continue
-
+        # PARİTE TARAMA DÖNGÜSÜ
         for coin in COINS:
             symbol = f"{coin}USDT"
             try:
-                time.sleep(0.2) # Rate limit yememek için güvenli bekleme süresi artırıldı
+                time.sleep(0.1) # İstek aralarında hafif es (Rate limit koruması)
                 
-                if symbol not in f_ticker_dict:
-                    continue
-                
-                # Günlük %8'den fazla fırlamışları doğrudan ele
-                if float(f_ticker_dict[symbol].get('priceChangePercent', 0)) > 8.0:
-                    continue
-                
-                # 3. 5 DAKİKALIK MUM VE TAKER BUY VERİLERİ (Vadeli Tahtadan)
-                res = requests.get(f"{FUTURES_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "5m", "limit": 20}, headers=HEADERS, timeout=4)
+                # 2. 5 DAKİKALIK VADELİ MUM VE TAKER BUY VERİLERİ
+                res = requests.get(f"{FUTURES_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "5m", "limit": 20}, headers=HEADERS, timeout=3)
                 if res.status_code != 200:
                     continue
                 klines = res.json()
@@ -96,20 +78,20 @@ def main():
                 current_vol = float(klines[-1][5])
                 taker_buy_vol = float(klines[-1][9])
                 
-                # 🛡️ KRİTİK KALKANLAR (Senin en çok verim aldığın yerler)
+                # 🛡️ ESKİ ÇALIŞAN KODUN TEMEL FİLTRE KALKANLARI
                 if current_close <= current_open:
                     continue
-                if taker_buy_vol < (current_vol * 0.55): # Taker Buy Filtresi
+                if taker_buy_vol < (current_vol * 0.55): # Taker Buy Güç Filtresi
                     continue
                 if current_close < mean(prices[:-1]):
                     continue
 
-                # YATAYLIK FORMASYONU (Sıkışma Kontrolü)
+                # YATAYLIK FORMASYONU (Son 1.5 saat içinde sıkışma kontrolü)
                 past_prices = prices[:-1]
                 if (max(past_prices) - min(past_prices)) / min(past_prices) > 0.04:
                     continue 
 
-                # Hacim Patlama Katsayısı
+                # Hacim Patlama Katsayısı Kontrolü
                 avg_vol = mean(volumes[:-2])
                 if avg_vol == 0:
                     continue
@@ -118,23 +100,36 @@ def main():
                 if ratio < 3.0:
                     continue 
 
-                quote_vol = float(f_ticker_dict[symbol].get('quoteVolume', 0))
+                # ----------------=======================================----------------
+                # BUKALEMUN ADIM: BURAYA KADAR GELEN COIN VARSA ÖZEL VERİLERİNİ ÇEKER 🌟
+                # ----------------=======================================----------------
+                try:
+                    ticker_res = requests.get(f"{FUTURES_URL}/fapi/v1/ticker/24hr", params={"symbol": symbol}, headers=HEADERS, timeout=3).json()
+                    price_change = float(ticker_res.get('priceChangePercent', 0))
+                    quote_vol = float(ticker_res.get('quoteVolume', 0))
+                except:
+                    continue # Eğer veri çekilemezse hata vermez, bir sonrakine geçer.
+
+                # Günlük %8'den fazla yükselenleri filtrele
+                if price_change > 8.0:
+                    continue
                 
-                # --------------------------------------------------------
-                # 💎 SINIF 1: ZIRHLI SİNYAL KONTROLÜ (VADELİ DESTEKLİ)
-                # --------------------------------------------------------
+                score = 3
+                stars = "⭐" * score
+
+                # 💎 SINIF 1: ZIRHLI SİNYAL KONTROLÜ (Gelişmiş Vadeli Filtreleri)
                 if ratio > 5.0 and quote_vol > 10000000:
                     
                     # 7 Günlük Gerçek Dip Kontrolü
                     try:
-                        res_7d = requests.get(f"{FUTURES_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1d", "limit": 7}, headers=HEADERS, timeout=4).json()
+                        res_7d = requests.get(f"{FUTURES_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1d", "limit": 7}, headers=HEADERS, timeout=3).json()
                         max_7d_high = max([float(k[2]) for k in res_7d])
                         if current_close > (max_7d_high * 0.85):
                             continue
                     except:
                         continue
 
-                    # Open Interest Kontrolü
+                    # Open Interest (OI) Kontrolü
                     try:
                         oi_res = requests.get(f"{FUTURES_URL}/fapi/v1/openInterestHist", params={"symbol": symbol, "period": "5m", "limit": 2}, headers=HEADERS, timeout=3).json()
                         if len(oi_res) >= 2:
@@ -157,8 +152,7 @@ def main():
                     except:
                         continue
 
-                    # L/S Divergansı & Yıldız Skorlama
-                    score = 4
+                    # L/S Divergansı
                     try:
                         ls_res = requests.get(f"{FUTURES_URL}/futures/data/globalLongShortAccountRatio", params={"symbol": symbol, "period": "5m", "limit": 2}, headers=HEADERS, timeout=3).json()
                         if len(ls_res) >= 2 and float(ls_res[1]['longAccount']) < float(ls_res[0]['longAccount']):
@@ -166,6 +160,7 @@ def main():
                     except:
                         pass
                     
+                    score += 1
                     stars = "⭐" * score
 
                     if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
@@ -179,12 +174,9 @@ def main():
                         sent_dict[symbol] = time.time()
                         continue
 
-                # --------------------------------------------------------
                 # 🤔 SINIF 2: ACABA SİNYALİ KONTROLÜ
-                # --------------------------------------------------------
                 if ratio > 3.0 and quote_vol > 1000000:
                     if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
-                        stars = "⭐" * 3
                         if ratio > 5.0:
                             stars += "⭐"
                         
@@ -198,7 +190,7 @@ def main():
             except:
                 pass
 
-        print(f"[{time.strftime('%H:%M:%S')}] Tarama başarıyla bitti. 60 sn bekleniyor...")
+        print(f"[{time.strftime('%H:%M:%S')}] Tarama sorunsuz bitti. 60 sn bekleniyor...")
         time.sleep(60)
 
 if __name__ == "__main__":
