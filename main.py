@@ -29,7 +29,7 @@ MAX_CONCURRENT_REQUESTS = 20
 last_signal = {}
 
 # ==================================================
-# TELEGRAM QUEUE (Spam koruması)
+# TELEGRAM QUEUE
 # ==================================================
 telegram_queue = asyncio.Queue()
 
@@ -144,7 +144,7 @@ def detect_sweep(highs, lows, closes):
     return sweep_up, sweep_down
 
 # ==================================================
-# SIDEWAYS BREAKOUT (ATR dinamik eşik + taban değer)
+# SIDEWAYS BREAKOUT (ATR dinamik + taban)
 # ==================================================
 def sideways_breakout(closes, atr_val=None):
     recent = closes[-15:]
@@ -152,7 +152,7 @@ def sideways_breakout(closes, atr_val=None):
     lowest = min(recent)
     range_pct = ((highest - lowest) / lowest) * 100
     if atr_val and highest > 0:
-        factor = max((atr_val / highest) * 2, 0.001)  # floor eklendi
+        factor = max((atr_val / highest) * 2, 0.001)
     else:
         factor = 0.002
     breakout_up = closes[-1] > highest * (1 - factor)
@@ -274,7 +274,7 @@ def classify_signal(score, vol_factor=1.0):
     return None
 
 # ==================================================
-# SEMBOL LISTESI (SADECE FUTURES USDT PERP)
+# SEMBOL LISTESI
 # ==================================================
 async def get_all_symbols(session):
     futures_symbols = []
@@ -289,7 +289,7 @@ async def get_all_symbols(session):
     return futures_symbols
 
 # ==================================================
-# COIN TARAMA (CANLI)
+# COIN TARAMA (CANLI) – DOKUNMADIM
 # ==================================================
 async def scan_coin(session, symbol, btc_bias, semaphore):
     async with semaphore:
@@ -487,11 +487,11 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
             print("SCAN ERROR:", symbol, e)
 
 # ==================================================
-# GERÇEKÇİ BACKTEST (200 coin, esnek filtre, optimize)
+# BACKTEST (AŞIRI GEVŞEK – SADECE SORUN GİDERME)
 # ==================================================
 async def run_backtest(session):
     try:
-        await send_telegram("📊 GERÇEKÇİ BACKTEST BAŞLATILIYOR... (son 3 gün, esnek filtreler)")
+        await send_telegram("📊 DEBUG BACKTEST BAŞLADI (filtreler çok gevşek)")
         total_signals = 0
         wins = 0
         total_pnl_net = 0.0
@@ -501,14 +501,18 @@ async def run_backtest(session):
 
         all_syms = await get_all_symbols(session)
         test_symbols = all_syms[:200]
+        print(f"Backtest için {len(test_symbols)} sembol bulundu.")
 
         for symbol in test_symbols:
             klines = await fetch_json(session, "/fapi/v1/klines",
                                       {"symbol": symbol, "interval": "5m", "limit": 1000})
             if not klines or len(klines) < 50:
                 continue
+
             for i in range(200, len(klines)-1):
                 window = klines[i-49:i+1] if i >= 49 else klines[:i+1]
+                if len(window) < 10:
+                    continue
                 closes = [float(k[4]) for k in window]
                 highs = [float(k[2]) for k in window]
                 lows = [float(k[3]) for k in window]
@@ -521,13 +525,9 @@ async def run_backtest(session):
                 taker_buy = float(last[9])
                 change = ((close_price - open_price) / open_price) * 100
 
-                if len(volumes) < 10:
-                    continue
-                vol_mean = mean(volumes)
-                vol_std = stdev(volumes) if len(volumes) > 1 else 0
-                vol_z = ((volume - vol_mean) / vol_std) if vol_std > 0 else 0
-
-                if abs(change) < 0.15 and vol_z < 0.5:
+                # EŞİKLERİ TAMAMEN KALDIRDIK (DEBUG)
+                # Sadece NaN kontrolü
+                if volume <= 0:
                     continue
 
                 regime = detect_regime(closes, volumes)
@@ -542,22 +542,31 @@ async def run_backtest(session):
 
                 long_score = 0
                 short_score = 0
-                if change > 1: long_score += 2
-                if change < -1: short_score += 2
-                if vol_z > 2: long_score += 2; short_score += 2
-                if regime == "TREND": long_score += 1; short_score += 1
-                if sweep_down: long_score += 3
-                if sweep_up: short_score += 3
-                if compressed and breakout_up: long_score += 3
-                if compressed and breakout_down: short_score += 3
+                # Sadece basit momentum puanı
+                if change > 0.5: long_score += 1
+                if change < -0.5: short_score += 1
+
+                if regime == "TREND":
+                    long_score += 1
+                    short_score += 1
+
+                if sweep_down: long_score += 2
+                if sweep_up: short_score += 2
+
+                if compressed and breakout_up: long_score += 2
+                if compressed and breakout_down: short_score += 2
+
                 if order_score > 0: long_score += order_score
                 if order_score < 0: short_score += abs(order_score)
-                if cvd_trend > 0: long_score += 2
-                if cvd_trend < 0: short_score += 2
+
+                if cvd_trend > 0: long_score += 1
+                elif cvd_trend < 0: short_score += 1
 
                 best_score = max(long_score, short_score)
-                signal_type = classify_signal(best_score, 0.8)
-                if not signal_type: continue
+                # Eşik çok düşük (vol_factor 0.3)
+                signal_type = classify_signal(best_score, 0.3)
+                if not signal_type:
+                    continue
 
                 direction = "LONG" if long_score > short_score else "SHORT"
                 entry = close_price
@@ -604,7 +613,7 @@ async def run_backtest(session):
         avg_pnl = total_pnl_net / total_signals if total_signals > 0 else 0
         profit_factor = (total_pnl_net + wins) / (abs(total_pnl_net) + (total_signals - wins)) if total_signals > 0 else 0
 
-        msg = (f"📊 GERÇEKÇİ BACKTEST (200 coin, esnek filtre)\n"
+        msg = (f"📊 DEBUG BACKTEST (gevşek filtreler)\n"
                f"Toplam Sinyal: {total_signals}\n"
                f"Kazanan: {wins} | Kaybeden: {total_signals - wins}\n"
                f"Win Rate: %{win_rate:.1f}\n"
@@ -620,10 +629,10 @@ async def run_backtest(session):
 # ANA DÖNGÜ
 # ==================================================
 async def main():
-    print("🚀 PROFESIONAL BOT (Loglama + ATR taban eklendi)")
+    print("🚀 PROFESIONAL BOT (DEBUG BACKTEST)")
     async with aiohttp.ClientSession() as session:
         asyncio.create_task(telegram_worker(session))
-        await send_telegram("✅ BOT ONLINE (Sadece Vadeli USDT)")
+        await send_telegram("✅ BOT ONLINE (DEBUG Backtest açık)")
         all_symbols = await get_all_symbols(session)
         print(f"Toplam futures coin: {len(all_symbols)}")
 
