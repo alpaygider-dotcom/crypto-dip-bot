@@ -71,15 +71,17 @@ def main():
                         send_telegram(f"💎 *ZIRHLI SİNYAL!* #{symbol}\n• Hacim: 2.3x+\n• 10M$ Hacim onaylı.")
                         sent_dict[symbol] = time.time()
                 
-                # Acaba Sinyali
+                #                 # ... (Zırhlı Sinyal kısmı aynı kalsın) ...
+                
+                # ACABA SİNYALİ (Filtreleri Gevşettik)
                 else:
                     volumes = [float(k[5]) for k in klines]
-                    if volumes[-1] / mean(volumes[:-2]) > 1.5:
+                    if volumes[-1] / mean(volumes[:-2]) > 1.3: # Hacim oranı 1.3'e düştü
+                        # Buradan daily_vol kontrolünü kaldırıyoruz ki her coin gelsin
                         if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 1800):
-                            send_telegram(f"🤔 *ACABA?* #{symbol}\nHacim patladı, takibe al.")
+                            send_telegram(f"🤔 *ACABA?* #{symbol}\nHacim hareketlendi, takibe al.")
                             sent_dict[symbol] = time.time()
-            except: continue
-        time.sleep(60)
+
 
 if __name__ == "__main__":
     main()
