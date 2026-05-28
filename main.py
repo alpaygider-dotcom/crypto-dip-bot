@@ -1,235 +1,330 @@
 import asyncio
 import aiohttp
-import time
 import os
+import time
 from statistics import mean, stdev
+from binance import AsyncClient
+from binance.enums import *
 
-# =========================
+# ==================================================
 # ENV
-# =========================
+# ==================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+
 BINANCE_KEY = os.getenv("BINANCE_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 
-FAPI = "https://fapi.binance.com"
-
-# =========================
+# ==================================================
 # CONFIG
-# =========================
-COINS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","ADAUSDT","AVAXUSDT"]
+# ==================================================
+COINS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "AVAXUSDT",
+    "ADAUSDT"
+]
+
+INTERVAL = "5m"
 
 SCAN_INTERVAL = 20
 COOLDOWN = 300
 
-MAX_RISK_PER_TRADE = 0.02   # %2 risk
-DAILY_LOSS_LIMIT = 0.05     # %5 stop
+LEVERAGE = 5
+RISK_PER_TRADE = 0.01
+MAX_DAILY_LOSS = 0.05
 
+USE_LIVE_TRADING = False   # ⚠️ TRUE yaparsan gerçek emir açar
+
+# ==================================================
+# GLOBALS
+# ==================================================
 last_signal = {}
-trade_memory = []
-
+daily_pnl = 0
 sem = asyncio.Semaphore(10)
 
-# =========================
-# ACCOUNT SIMULATION (paper logic)
-# =========================
-equity = 1000
-daily_pnl = 0
-
-# =========================
+# ==================================================
 # TELEGRAM
-# =========================
-async def send(session, msg):
-    if not BOT_TOKEN:
-        print(msg)
+# ==================================================
+async def send_telegram(session, text):
+    if not BOT_TOKEN or not CHAT_ID:
+        print(text)
         return
 
     try:
         await session.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": msg}
+            json={
+                "chat_id": CHAT_ID,
+                "text": text
+            }
         )
-    except:
-        pass
+    except Exception as e:
+        print("Telegram Error:", e)
 
-# =========================
+# ==================================================
 # FETCH
-# =========================
-async def fetch(session, url, params=None):
+# ==================================================
+async def fetch_klines(client, symbol):
     try:
-        async with sem:
-            async with session.get(url, params=params, timeout=10) as r:
-                return await r.json()
+        return await client.futures_klines(
+            symbol=symbol,
+            interval=INTERVAL,
+            limit=50
+        )
     except:
         return None
 
-# =========================
-# REGIME
-# =========================
+# ==================================================
+# MARKET REGIME
+# ==================================================
 def regime(closes, vols):
-    if len(closes) < 20:
-        return "UNKNOWN"
-
     ret = (closes[-1] - closes[0]) / closes[0]
-    vol = stdev(vols) if len(vols) > 1 else 0
 
-    if abs(ret) < 0.002 and vol < mean(vols):
+    vol_mean = mean(vols)
+    vol_std = stdev(vols) if len(vols) > 1 else 0
+
+    vol_z = (vols[-1] - vol_mean) / vol_std if vol_std else 0
+
+    if abs(ret) < 0.003:
         return "RANGE"
-    if abs(ret) > 0.01:
+
+    if abs(ret) > 0.01 and vol_z > 1:
         return "TREND"
+
     return "MIXED"
 
-# =========================
-# RISK ENGINE (NEW)
-# =========================
-def position_size(score):
-    base = equity * MAX_RISK_PER_TRADE
-    multiplier = min(score / 10, 1.5)
-    return base * multiplier
+# ==================================================
+# LIQUIDITY SWEEP
+# ==================================================
+def liquidity_sweep(highs, lows, closes):
+    sweep_up = (
+        highs[-1] > max(highs[-10:-1])
+        and closes[-1] < highs[-1]
+    )
 
-def risk_check():
-    if abs(daily_pnl) > equity * DAILY_LOSS_LIMIT:
-        return False
-    return True
+    sweep_down = (
+        lows[-1] < min(lows[-10:-1])
+        and closes[-1] > lows[-1]
+    )
 
-# =========================
-# SCORING (SMART MONEY)
-# =========================
-def score(change, vol_z, taker, reg, sweep):
-    L, S = 0, 0
+    return sweep_up, sweep_down
 
-    if change > 1: L += 2
-    if change < -1: S += 2
+# ==================================================
+# SCORE ENGINE
+# ==================================================
+def calculate_score(change, taker_ratio, vol_z,
+                    reg, sweep_up, sweep_down):
 
-    if vol_z > 1.5: L += 2
-    if vol_z < -1.5: S += 2
+    long_score = 0
+    short_score = 0
 
-    if taker > 0.6: L += 2
-    if taker < 0.4: S += 2
+    # momentum
+    if change > 1:
+        long_score += 2
 
+    if change < -1:
+        short_score += 2
+
+    # taker pressure
+    if taker_ratio > 0.6:
+        long_score += 2
+
+    if taker_ratio < 0.4:
+        short_score += 2
+
+    # anomaly volume
+    if vol_z > 1.5:
+        long_score += 2
+
+    # regime
     if reg == "TREND":
-        L += 1; S += 1
+        long_score += 1
+        short_score += 1
 
-    if sweep == "DOWN":
-        L += 3
-    if sweep == "UP":
-        S += 3
+    if reg == "RANGE":
+        long_score -= 1
+        short_score -= 1
 
-    return L, S
+    # liquidity
+    if sweep_down:
+        long_score += 3
 
-# =========================
-# EXECUTION ENGINE (PAPER / READY FOR LIVE)
-# =========================
-async def execute_trade(session, symbol, direction, size):
-    global equity, daily_pnl
+    if sweep_up:
+        short_score += 3
 
-    # ⚠️ PAPER MODE (no real trade)
-    pnl = size * 0.01  # fake outcome simulation
+    return long_score, short_score
 
-    if direction == "LONG":
-        equity += pnl
-    else:
-        equity += pnl
+# ==================================================
+# POSITION SIZE
+# ==================================================
+def calculate_qty(balance, price):
+    risk_amount = balance * RISK_PER_TRADE
+    qty = (risk_amount * LEVERAGE) / price
+    return round(qty, 3)
 
-    daily_pnl += pnl
+# ==================================================
+# EXECUTE TRADE
+# ==================================================
+async def execute_trade(client, symbol, direction,
+                        qty, entry_price):
 
-    trade_memory.append({
-        "symbol": symbol,
-        "direction": direction,
-        "pnl": pnl
-    })
+    if not USE_LIVE_TRADING:
+        print(f"[PAPER] {symbol} {direction}")
+        return True
 
-    msg = f"EXECUTED {symbol} {direction} | PnL: {pnl:.2f} | Equity: {equity:.2f}"
-    await send(session, msg)
-
-# =========================
-# SCAN
-# =========================
-async def scan(session, symbol):
     try:
-        kl = await fetch(session, f"{FAPI}/fapi/v1/klines",
-                         {"symbol": symbol, "interval": "5m", "limit": 50})
+        side = SIDE_BUY if direction == "LONG" else SIDE_SELL
+
+        await client.futures_change_leverage(
+            symbol=symbol,
+            leverage=LEVERAGE
+        )
+
+        order = await client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type=FUTURE_ORDER_TYPE_MARKET,
+            quantity=qty
+        )
+
+        print("ORDER:", order)
+        return True
+
+    except Exception as e:
+        print("ORDER ERROR:", e)
+        return False
+
+# ==================================================
+# SCAN
+# ==================================================
+async def scan(client, session, symbol):
+
+    global daily_pnl
+
+    try:
+        kl = await fetch_klines(client, symbol)
 
         if not kl:
-            return None
+            return
 
         closes = [float(k[4]) for k in kl]
-        vols = [float(k[5]) for k in kl]
         highs = [float(k[2]) for k in kl]
         lows = [float(k[3]) for k in kl]
+        vols = [float(k[5]) for k in kl]
 
         last = kl[-2]
 
         open_p = float(last[1])
         close_p = float(last[4])
         vol = float(last[5])
-        taker = float(last[9])
+        taker_buy = float(last[9])
 
         change = ((close_p - open_p) / open_p) * 100
 
-        v_mean = mean(vols)
-        v_std = stdev(vols) if len(vols) > 1 else 0
-        vol_z = (vol - v_mean) / v_std if v_std else 0
+        taker_ratio = taker_buy / vol if vol else 0
+
+        vol_mean = mean(vols)
+        vol_std = stdev(vols) if len(vols) > 1 else 0
+
+        vol_z = (vol - vol_mean) / vol_std if vol_std else 0
 
         reg = regime(closes, vols)
 
-        sweep_up = highs[-1] > max(highs[-10:-1]) and closes[-1] < highs[-1]
-        sweep_down = lows[-1] < min(lows[-10:-1]) and closes[-1] > lows[-1]
+        sweep_up, sweep_down = liquidity_sweep(
+            highs, lows, closes
+        )
 
-        L, S = score(change, vol_z, taker/vol if vol else 0, reg,
-                      "DOWN" if sweep_down else "UP" if sweep_up else "NONE")
+        long_score, short_score = calculate_score(
+            change,
+            taker_ratio,
+            vol_z,
+            reg,
+            sweep_up,
+            sweep_down
+        )
 
-        if max(L, S) < 7:
-            return None
+        if max(long_score, short_score) < 7:
+            return
 
-        direction = "LONG" if L > S else "SHORT"
-        final_score = max(L, S)
+        direction = (
+            "LONG"
+            if long_score > short_score
+            else "SHORT"
+        )
 
-        # cooldown
         now = time.time()
-        if symbol in last_signal and now - last_signal[symbol] < COOLDOWN:
-            return None
+
+        if symbol in last_signal:
+            if now - last_signal[symbol] < COOLDOWN:
+                return
 
         last_signal[symbol] = now
 
-        # RISK CHECK
-        if not risk_check():
-            return None
+        # fake balance
+        fake_balance = 1000
 
-        size = position_size(final_score)
+        qty = calculate_qty(fake_balance, close_p)
 
-        # EXECUTE (paper)
-        await execute_trade(session, symbol, direction, size)
+        ok = await execute_trade(
+            client,
+            symbol,
+            direction,
+            qty,
+            close_p
+        )
 
-        return {
-            "symbol": symbol,
-            "score": final_score,
-            "direction": direction,
-            "regime": reg
-        }
+        if not ok:
+            return
 
-    except:
-        return None
+        msg = (
+            f"{'🟢' if direction=='LONG' else '🔴'} "
+            f"{symbol}\n"
+            f"Direction: {direction}\n"
+            f"Score: {max(long_score, short_score)}\n"
+            f"Change: %{round(change,2)}\n"
+            f"Vol Z: {round(vol_z,2)}\n"
+            f"Regime: {reg}\n"
+            f"Qty: {qty}"
+        )
 
-# =========================
-# MAIN LOOP
-# =========================
+        print(msg)
+
+        await send_telegram(session, msg)
+
+    except Exception as e:
+        print("SCAN ERROR:", symbol, e)
+
+# ==================================================
+# MAIN
+# ==================================================
 async def main():
-    print("V11 INSTITUTIONAL ENGINE STARTED")
+
+    print("🚀 FINAL AI BOT STARTED")
+
+    client = await AsyncClient.create(
+        BINANCE_KEY,
+        BINANCE_SECRET
+    )
 
     async with aiohttp.ClientSession() as session:
+
         while True:
-            tasks = [scan(session, c) for c in COINS]
-            res = await asyncio.gather(*tasks)
 
-            signals = [r for r in res if r]
+            tasks = [
+                scan(client, session, c)
+                for c in COINS
+            ]
 
-            for s in signals:
-                msg = f"{s['symbol']} {s['direction']} | SCORE {s['score']} | REGIME {s['regime']}"
-                print(msg)
-                await send(session, msg)
+            await asyncio.gather(*tasks)
 
             await asyncio.sleep(SCAN_INTERVAL)
 
+# ==================================================
+# START
+# ==================================================
 if __name__ == "__main__":
     asyncio.run(main())
+``
