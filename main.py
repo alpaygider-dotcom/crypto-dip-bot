@@ -13,9 +13,10 @@ HEADERS = {
     "Accept": "application/json"
 }
 
+SPOT_URL = "https://api.binance.com"
 FUTURES_URL = "https://fapi.binance.com"
 
-# ASLA KİLİTLENMEYEN ESKİ STABİL PARİTE LİSTEMİZ
+# STABİL ÇALIŞAN 73 PARİTELİK LİSTEMİZ
 COINS = [
     "1000LUNC", "1000SHIB", "1000XEC", "ADA", "AGLD", "APE", "APT", "AR", "ARB", "ARKM",
     "ATOM", "AVAX", "BANANA", "BCH", "BLUR", "BNB", "BONK", "CELO", "CRV", "CYBER",
@@ -35,162 +36,160 @@ def send_telegram(msg):
         pass
 
 def main():
-    print("🚀 BOT GÜVENLİ VE HAFİF MODDA BAŞLATILDI (YALNIZCA FUTURES VERİSİ) 🚀")
+    print("🔥 BOT HİBRİT MODDA BAŞLATILDI: ZIRHLI (VADELİ) & ACABA (SPOT+VADELİ) 🔥")
     sent_dict = {}
     
     while True:
-        print(f"\n[{time.strftime('%H:%M:%S')}] {len(COINS)} Vadeli Parite Analiz Ediliyor...")
+        print(f"\n[{time.strftime('%H:%M:%S')}] {len(COINS)} Parite Eşzamanlı Taranıyor...")
         
-        # 1. BTC VADELİ HACİM KONTROLÜ (Piyasa Güvenliği)
+        # MARKET GÜVENLİĞİ: BTC Vadeli Hacim Patlaması Kontrolü
         btc_is_pumping = False
         try:
-            btc_k = requests.get(f"{FUTURES_URL}/fapi/v1/klines", params={"symbol": "BTCUSDT", "interval": "5m", "limit": 20}, headers=HEADERS, timeout=3).json()
-            btc_vols = [float(k[5]) for k in btc_k]
-            if (btc_vols[-1] / mean(btc_vols[:-2])) > 2.2:
+            btc_res = requests.get(f"{FUTURES_URL}/fapi/v1/klines", params={"symbol": "BTCUSDT", "interval": "5m", "limit": 20}, headers=HEADERS, timeout=3).json()
+            btc_vols = [float(k[5]) for k in btc_res]
+            if (btc_vols[-1] / mean(btc_vols[:-2])) > 2.5:
                 btc_is_pumping = True
         except:
             pass
 
         if btc_is_pumping:
-            print("⚠️ BTC tahtasında ani agresif hacim! Tarama 1 dk erteleniyor...")
+            print("⚠️ BTC Vadeli tahtasında aşırı agresif hacim! Tarama 1 dk askıya alınıyor...")
             time.sleep(60)
             continue
 
-        # PARİTE TARAMA DÖNGÜSÜ
+        # ANA TARAMA DÖNGÜSÜ
         for coin in COINS:
             symbol = f"{coin}USDT"
             try:
-                time.sleep(0.1) # İstek aralarında hafif es (Rate limit koruması)
+                time.sleep(0.2) # Rate limit (API Ban) yememek için her paritede güvenli es
                 
-                # 2. 5 DAKİKALIK VADELİ MUM VE TAKER BUY VERİLERİ
-                res = requests.get(f"{FUTURES_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "5m", "limit": 20}, headers=HEADERS, timeout=3)
-                if res.status_code != 200:
+                # ----------------=======================================----------------
+                # ORTAK ADIM: VADELİ (FUTURES) 5M MUM VE TAKER BUY VERİLERİ
+                # ----------------=======================================----------------
+                f_res = requests.get(f"{FUTURES_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "5m", "limit": 20}, headers=HEADERS, timeout=3)
+                if f_res.status_code != 200:
                     continue
-                klines = res.json()
-                if len(klines) < 20:
+                f_klines = f_res.json()
+                if len(f_klines) < 20:
                     continue
                 
-                prices = [float(k[4]) for k in klines]
-                volumes = [float(k[5]) for k in klines]
+                f_prices = [float(k[4]) for k in f_klines]
+                f_volumes = [float(k[5]) for k in f_klines]
                 
-                current_open = float(klines[-1][1])
-                current_close = float(klines[-1][4])
-                current_vol = float(klines[-1][5])
-                taker_buy_vol = float(klines[-1][9])
+                f_open = float(f_klines[-1][1])
+                f_close = float(f_klines[-1][4])
+                f_vol = float(f_klines[-1][5])
+                taker_buy_vol = float(f_klines[-1][9])
                 
-                # 🛡️ ESKİ ÇALIŞAN KODUN TEMEL FİLTRE KALKANLARI
-                if current_close <= current_open:
+                # ❌ GÜVENLİK FİLTRESİ 1: Mum kırmızıysa veya nötrse geç (Yükselen mum arıyoruz)
+                if f_close <= f_open:
                     continue
-                if taker_buy_vol < (current_vol * 0.55): # Taker Buy Güç Filtresi
+                
+                # ❌ GÜVENLİK FİLTRESİ 2: Taker Buy Güç Kontrolü (Görsel 1'deki istek)
+                # Fake hacmi, wash trading'i ve satış baskılı mumları eler.
+                if taker_buy_vol < (f_vol * 0.55):
                     continue
-                if current_close < mean(prices[:-1]):
+                
+                # ❌ GÜVENLİK FİLTRESİ 3: Fiyat önceki mumların ortalamasının altındaysa geç
+                if f_close < mean(f_prices[:-1]):
                     continue
 
-                # YATAYLIK FORMASYONU (Son 1.5 saat içinde sıkışma kontrolü)
-                past_prices = prices[:-1]
-                if (max(past_prices) - min(past_prices)) / min(past_prices) > 0.04:
-                    continue 
-
-                # Hacim Patlama Katsayısı Kontrolü
-                avg_vol = mean(volumes[:-2])
-                if avg_vol == 0:
+                # ❌ GÜVENLİK FİLTRESİ 4: Vadeli tarafta son 1.5 saatlik yataylık/sıkışma kontrolü
+                f_past_prices = f_prices[:-1]
+                if (max(f_past_prices) - min(f_past_prices)) / min(f_past_prices) > 0.04:
                     continue
-                ratio = volumes[-1] / avg_vol
+
+                # ❌ GÜVENLİK FİLTRESİ 5: Vadeli Hacim Patlama Katsayısı Kontrolü
+                f_avg_vol = mean(f_volumes[:-2])
+                if f_avg_vol == 0:
+                    continue
+                f_ratio = f_vol / f_avg_vol
                 
-                if ratio < 3.0:
-                    continue 
+                # Eğer vadeli tarafta en az 3 katı bir hacim patlaması yoksa diğer sorgulara hiç geçme
+                if f_ratio < 3.0:
+                    continue
 
                 # ----------------=======================================----------------
-                # BUKALEMUN ADIM: BURAYA KADAR GELEN COIN VARSA ÖZEL VERİLERİNİ ÇEKER 🌟
+                # MOD 1: ZIRHLI SİNYAL DEĞERLENDİRMESİ (SADECE VADELİ METRİKLERİ)
                 # ----------------=======================================----------------
-                try:
-                    ticker_res = requests.get(f"{FUTURES_URL}/fapi/v1/ticker/24hr", params={"symbol": symbol}, headers=HEADERS, timeout=3).json()
-                    price_change = float(ticker_res.get('priceChangePercent', 0))
-                    quote_vol = float(ticker_res.get('quoteVolume', 0))
-                except:
-                    continue # Eğer veri çekilemezse hata vermez, bir sonrakine geçer.
-
-                # Günlük %8'den fazla yükselenleri filtrele
-                if price_change > 8.0:
-                    continue
-                
-                score = 3
-                stars = "⭐" * score
-
-                # 💎 SINIF 1: ZIRHLI SİNYAL KONTROLÜ (Gelişmiş Vadeli Filtreleri)
-                if ratio > 5.0 and quote_vol > 10000000:
-                    
-                    # 7 Günlük Gerçek Dip Kontrolü
+                # Şartlar: Güçlü hacim patlaması (>5.0x) ve ek vadeli metriklerinin tam doğrulanması
+                if f_ratio >= 5.0:
                     try:
-                        res_7d = requests.get(f"{FUTURES_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1d", "limit": 7}, headers=HEADERS, timeout=3).json()
-                        max_7d_high = max([float(k[2]) for k in res_7d])
-                        if current_close > (max_7d_high * 0.85):
-                            continue
-                    except:
-                        continue
-
-                    # Open Interest (OI) Kontrolü
-                    try:
+                        # 1. Funding Oranı Kontrolü (Görsel 3: funding < 0.015)
+                        funding_res = requests.get(f"{FUTURES_URL}/fapi/v1/premiumIndex", params={"symbol": symbol}, headers=HEADERS, timeout=3).json()
+                        funding_rate = float(funding_res.get('lastFundingRate', 0))
+                        
+                        # 2. OI (Open Interest) Kontrolü (Görsel 4: OI > +%2 artış fiyat yatayken)
                         oi_res = requests.get(f"{FUTURES_URL}/fapi/v1/openInterestHist", params={"symbol": symbol, "period": "5m", "limit": 2}, headers=HEADERS, timeout=3).json()
-                        if len(oi_res) >= 2:
+                        
+                        # 3. L/S Hesap Oranı Kontrolü (Görsel 6: Fiyat yükselirken Long azalıyorsa = Short Squeeze)
+                        ls_res = requests.get(f"{FUTURES_URL}/futures/data/globalLongShortAccountRatio", params={"symbol": symbol, "period": "5m", "limit": 2}, headers=HEADERS, timeout=3).json()
+                        
+                        if funding_rate < 0.015 and len(oi_res) >= 2 and len(ls_res) >= 2:
                             prev_oi = float(oi_res[0]['sumOpenInterest'])
                             curr_oi = float(oi_res[1]['sumOpenInterest'])
                             oi_change = ((curr_oi - prev_oi) / prev_oi) * 100 if prev_oi > 0 else 0
-                            if oi_change < 1.5:
-                                continue
-                        else:
-                            continue
-                    except:
-                        continue
-
-                    # Funding Rate Kontrolü
-                    try:
-                        funding_res = requests.get(f"{FUTURES_URL}/fapi/v1/premiumIndex", params={"symbol": symbol}, headers=HEADERS, timeout=3).json()
-                        funding_rate = float(funding_res.get('lastFundingRate', 0))
-                        if funding_rate > 0.015:
-                            continue
-                    except:
-                        continue
-
-                    # L/S Divergansı
-                    try:
-                        ls_res = requests.get(f"{FUTURES_URL}/futures/data/globalLongShortAccountRatio", params={"symbol": symbol, "period": "5m", "limit": 2}, headers=HEADERS, timeout=3).json()
-                        if len(ls_res) >= 2 and float(ls_res[1]['longAccount']) < float(ls_res[0]['longAccount']):
-                            score += 1
+                            
+                            prev_long = float(ls_res[0]['longAccount'])
+                            curr_long = float(ls_res[1]['longAccount'])
+                            
+                            # Güçlü OI artışı ve Long rasyonun azalması (Fiyat yukarı giderken küçük yatırımcı short açıyor veya long kapatıyor)
+                            if oi_change >= 2.0 and curr_long < prev_long:
+                                
+                                if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
+                                    send_telegram(f"💎 *ZIRHLI VADELİ SİNYAL* #{symbol}\n\n"
+                                                  f"• *Güven Skoru:* ⭐⭐⭐⭐⭐\n"
+                                                  f"• Vadeli Hacim Patlaması: {round(f_ratio,1)}x\n"
+                                                  f"• OI (Açık Faiz) Artışı: +%{round(oi_change,2)}\n"
+                                                  f"• Fonlama Oranı: %{round(funding_rate*100,3)}\n"
+                                                  f"• Analiz: Fiyat Yatayken Dev Sıkışma Kırılımı\n"
+                                                  f"• Dinamik: Longlar Azalıyor / Balina Gerçek Alımda! 🚀")
+                                    sent_dict[symbol] = time.time()
+                                    continue # Zırhlı attıysa Acaba'yı kontrol etmeye gerek yok, sonrakine geç.
                     except:
                         pass
-                    
-                    score += 1
-                    stars = "⭐" * score
 
-                    if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
-                        send_telegram(f"💎 *ZIRHLI VADELİ SİNYAL* #{symbol}\n\n"
-                                      f"• *Güven Skoru:* {stars}\n"
-                                      f"• Hacim Patlaması: {round(ratio,1)}x\n"
-                                      f"• Para Girişi (OI): +%{round(oi_change,2)}\n"
-                                      f"• Fonlama Oranı: %{round(funding_rate*100,3)}\n"
-                                      f"• Durum: 7 Günlük Dipte Sıkışma Kırılımı\n"
-                                      f"• Detay: Küçük Yatırımcı Eleniyor (L/S Düşüşü)")
-                        sent_dict[symbol] = time.time()
-                        continue
-
-                # 🤔 SINIF 2: ACABA SİNYALİ KONTROLÜ
-                if ratio > 3.0 and quote_vol > 1000000:
-                    if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
-                        if ratio > 5.0:
-                            stars += "⭐"
+                # ----------------=======================================----------------
+                # MOD 2: ACABA SİNYALİ DEĞERLENDİRMESİ (HEM SPOT HEM VADELİ HİBRİT)
+                # ----------------=======================================----------------
+                # Şartlar: Vadeli hacim patlaması >3.0x olan coinin SPOT tahtasında gerçek dipte olması
+                try:
+                    time.sleep(0.1) # Spot sorgusu öncesi mikro es
+                    # 1. SPOT 7 Günlük Mum Verileri (Görsel 5: Gerçek dip mi mid-range mi kontrolü)
+                    s_res = requests.get(f"{SPOT_URL}/api/v3/klines", params={"symbol": symbol, "interval": "1d", "limit": 7}, headers=HEADERS, timeout=3)
+                    if s_res.status_code == 200:
+                        s_klines = s_res.json()
+                        s_prices_7d = [float(k[2]) for k in s_klines] # En yüksek (High) fiyatlar listesi
+                        s_7d_high = max(s_prices_7d)
                         
-                        send_telegram(f"🤔 *ACABA SİNYALİ* #{symbol}\n\n"
-                                      f"• *Güven Skoru:* {stars}\n"
-                                      f"• Hacim Patlaması: {round(ratio,1)}x\n"
-                                      f"• Konum: Dip Bölgesi Gerçek Alıcı Baskısı\n"
-                                      f"• Not: Sabırlı Akümülasyondan Çıkış")
-                        sent_dict[symbol] = time.time()
+                        # Güncel spot fiyatı çekelim
+                        s_ticker = requests.get(f"{SPOT_URL}/api/v3/ticker/price", params={"symbol": symbol}, headers=HEADERS, timeout=3).json()
+                        current_spot_price = float(s_ticker.get('price', 0))
+                        
+                        # Formül (Görsel 5): current_price < 7d_high * 0.8 (Son 7 gün zirvesine göre %20+ ucuz, yani dipten kalkıyor)
+                        if current_spot_price > 0 and current_spot_price < (s_7d_high * 0.8):
+                            
+                            # 2. 24 Saatlik Spot Hacim Kontrolü (Malın gerçekten toplanıp toplanmadığı)
+                            s_ticker_24h = requests.get(f"{SPOT_URL}/api/v3/ticker/24hr", params={"symbol": symbol}, headers=HEADERS, timeout=3).json()
+                            spot_quote_vol = float(s_ticker_24h.get('quoteVolume', 0)) # USDT bazlı hacim
+                            
+                            if spot_quote_vol > 1000000: # Spotta hacim sıfır değilse, gerçek alıcı varsa
+                                if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
+                                    send_telegram(f"🤔 *ACABA SİNYALİ (HİBRİT)* #{symbol}\n\n"
+                                                  f"• *Güven Skoru:* ⭐⭐⭐\n"
+                                                  f"• Vadeli Hacim Patlaması: {round(f_ratio,1)}x\n"
+                                                  f"• Spot Durumu: 7 Günlük Zirveden %20+ Aşağıda (Gerçek Dip)\n"
+                                                  f"• 24s Spot Hacmi: ${round(spot_quote_vol/1000000, 2)}M\n"
+                                                  f"• Not: Hareket vadeli tarafta başladı, spot dip yapısı onaylandı.")
+                                    sent_dict[symbol] = time.time()
+                except:
+                    pass
 
-            except:
+            except Exception as e:
+                # Herhangi bir paritede beklenmedik bir hata (bağlantı kopması vs.) olursa botun çökmesini engeller
                 pass
 
-        print(f"[{time.strftime('%H:%M:%S')}] Tarama sorunsuz bitti. 60 sn bekleniyor...")
+        print(f"[{time.strftime('%H:%M:%S')}] Tüm pariteler güvenle tarandı. 60 saniye dinleniliyor...")
         time.sleep(60)
 
 if __name__ == "__main__":
