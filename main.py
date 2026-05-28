@@ -7,14 +7,8 @@ import traceback
 from statistics import mean, stdev
 
 # ==================================================
-# LOG AYARLARI
+# CONFIG
 # ==================================================
-logging.basicConfig(
-    filename='bot_errors.log',
-    level=logging.ERROR,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 COINGLASS_API_KEY = os.getenv("COINGLASS_API_KEY")
@@ -28,6 +22,32 @@ MAX_CONCURRENT_REQUESTS = 20
 last_signal = {}
 
 # ==================================================
+# PORTFOLIO & RISK
+# ==================================================
+balance = 1000.0
+equity = 1000.0
+daily_pnl = 0.0
+consecutive_losses = 0
+trading_paused = False
+
+weights = {
+    "trend": 1.0,
+    "volume": 1.0,
+    "breakout": 1.0,
+    "whale": 1.0,
+    "regime": 1.0
+}
+
+# ==================================================
+# LOGGING
+# ==================================================
+logging.basicConfig(
+    filename='bot_errors.log',
+    level=logging.ERROR,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# ==================================================
 # TELEGRAM QUEUE
 # ==================================================
 telegram_queue = asyncio.Queue()
@@ -36,18 +56,11 @@ async def telegram_worker(session):
     while True:
         text = await telegram_queue.get()
         try:
-            if not BOT_TOKEN or not CHAT_ID:
-                print(text)
-            else:
+            if BOT_TOKEN and CHAT_ID:
                 url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-                payload = {"chat_id": CHAT_ID, "text": text}
-                async with session.post(url, json=payload, timeout=10) as resp:
-                    if resp.status == 429:
-                        await asyncio.sleep(1)
-                        await telegram_queue.put(text)
-        except Exception as e:
-            logging.error(f"TELEGRAM ERROR: {traceback.format_exc()}")
-            print("TELEGRAM ERROR:", e)
+                await session.post(url, json={"chat_id": CHAT_ID, "text": text})
+        except:
+            pass
         finally:
             telegram_queue.task_done()
         await asyncio.sleep(0.35)
@@ -56,213 +69,151 @@ async def send_telegram(text):
     await telegram_queue.put(text)
 
 # ==================================================
-# FETCH (GELİŞMİŞ HATA LOGU + IPv4)
+# FETCH (orijinal)
 # ==================================================
 async def fetch_json(session, endpoint, params=None):
     try:
         url = BASE_URL + endpoint
-        async with session.get(url, params=params, timeout=10) as response:
-            if response.status != 200:
-                logging.error(f"HTTP {response.status} for {url}")
-                return None
-            return await response.json()
-    except Exception:
-        logging.exception(f"Fetch failed: {endpoint}")
-        return None
+        async with session.get(url, params=params, timeout=10) as resp:
+            if resp.status == 200:
+                return await resp.json()
+    except:
+        pass
+    return None
 
 # ==================================================
-# EMA
+# INDICATORS
 # ==================================================
 def ema(values, period):
     if len(values) < period:
         return None
-    multiplier = 2 / (period + 1)
-    ema_value = mean(values[:period])
-    for price in values[period:]:
-        ema_value = ((price - ema_value) * multiplier) + ema_value
-    return ema_value
+    m = 2 / (period + 1)
+    e = mean(values[:period])
+    for x in values[period:]:
+        e = (x - e) * m + e
+    return e
 
-# ==================================================
-# ATR
-# ==================================================
-def calculate_atr(highs, lows, closes, period=14):
+def atr(highs, lows, closes, period=14):
     if len(highs) < period + 1:
         return None
-    tr_list = []
+    tr = []
     for i in range(1, len(highs)):
-        tr = max(highs[i] - lows[i],
-                 abs(highs[i] - closes[i-1]),
-                 abs(lows[i] - closes[i-1]))
-        tr_list.append(tr)
-    if len(tr_list) < period:
-        return None
-    atr = mean(tr_list[-period:])
-    return atr
+        tr.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
+    return mean(tr[-period:])
 
-# ==================================================
-# BTC BIAS
-# ==================================================
-async def get_btc_bias(session):
-    klines = await fetch_json(session, "/fapi/v1/klines",
-                              {"symbol": "BTCUSDT", "interval": "15m", "limit": 50})
-    if not klines:
-        return "NEUTRAL"
-    closes = [float(k[4]) for k in klines]
-    ema20 = ema(closes, 20)
-    ema50 = ema(closes, 50)
-    last_price = closes[-1]
-    if ema20 and ema50:
-        if last_price > ema20 and ema20 > ema50:
-            return "BULLISH"
-        if last_price < ema20 and ema20 < ema50:
-            return "BEARISH"
-    return "NEUTRAL"
-
-# ==================================================
-# REGIME (gelişmiş)
-# ==================================================
 def detect_regime(closes, volumes):
     move = (closes[-1] - closes[0]) / closes[0]
-    vol_mean = mean(volumes)
-    vol_std = stdev(volumes) if len(volumes) > 1 else 0
-    vol_z = (volumes[-1] - vol_mean) / vol_std if vol_std > 0 else 0
+    vm = mean(volumes)
+    vs = stdev(volumes) if len(volumes) > 1 else 0
+    vz = (volumes[-1] - vm) / vs if vs > 0 else 0
     score = 0
     if abs(move) > 0.01: score += 1
     if abs(move) > 0.02: score += 1
-    if vol_z > 1: score += 1
-    if score >= 2:
-        return "TREND"
-    if abs(move) < 0.003:
-        return "RANGE"
+    if vz > 1: score += 1
+    if score >= 2: return "TREND"
+    if abs(move) < 0.003: return "RANGE"
     return "MIXED"
 
-# ==================================================
-# SWEEP (gelişmiş, 20 bar)
-# ==================================================
 def detect_sweep(highs, lows, closes):
-    recent_high = max(highs[-20:-1])
-    recent_low = min(lows[-20:-1])
-    sweep_up = highs[-1] > recent_high and closes[-1] < highs[-1]
-    sweep_down = lows[-1] < recent_low and closes[-1] > lows[-1]
-    return sweep_up, sweep_down
+    rh = max(highs[-20:-1])
+    rl = min(lows[-20:-1])
+    up = highs[-1] > rh and closes[-1] < highs[-1]
+    down = lows[-1] < rl and closes[-1] > lows[-1]
+    return up, down
 
-# ==================================================
-# SIDEWAYS BREAKOUT (ATR dinamik + floor)
-# ==================================================
 def sideways_breakout(closes, atr_val=None):
     recent = closes[-15:]
     highest = max(recent)
     lowest = min(recent)
     range_pct = ((highest - lowest) / lowest) * 100
-    if atr_val and highest > 0:
-        factor = max((atr_val / highest) * 2, 0.001)
-    else:
-        factor = 0.002
-    breakout_up = closes[-1] > highest * (1 - factor)
-    breakout_down = closes[-1] < lowest * (1 + factor)
-    compressed = range_pct < 2.5
-    return compressed, breakout_up, breakout_down
+    factor = max((atr_val / highest) * 2, 0.001) if (atr_val and highest > 0) else 0.002
+    up = closes[-1] > highest * (1 - factor)
+    down = closes[-1] < lowest * (1 + factor)
+    return range_pct < 2.5, up, down
 
-# ==================================================
-# ORDERFLOW + CVD
-# ==================================================
-def orderflow_strength(volume, taker_buy, historical_taker_buys=None, historical_volumes=None):
+def orderflow_strength(volume, taker_buy, hist_tb=None, hist_vol=None):
     if volume <= 0:
         return 0, 0
-    taker_ratio = taker_buy / volume
-    delta = taker_buy - (volume - taker_buy)
-    delta_ratio = delta / volume
+    ratio = taker_buy / volume
+    delta = (taker_buy - (volume - taker_buy)) / volume
     score = 0
-    if taker_ratio > 0.62: score += 2
-    if taker_ratio < 0.38: score -= 2
-    if delta_ratio > 0.18: score += 2
-    if delta_ratio < -0.18: score -= 2
+    if ratio > 0.62: score += 2
+    if ratio < 0.38: score -= 2
+    if delta > 0.18: score += 2
+    if delta < -0.18: score -= 2
 
     cvd_trend = 0
-    if historical_taker_buys and historical_volumes and len(historical_taker_buys) >= 5:
+    if hist_tb and hist_vol and len(hist_tb) >= 5:
+        cvd_vals = []
         cvd = 0
-        cvd_values = []
-        for tb, vol in zip(historical_taker_buys[-10:], historical_volumes[-10:]):
-            delta_candle = tb - (vol - tb) if vol > 0 else 0
-            cvd += delta_candle
-            cvd_values.append(cvd)
-        if len(cvd_values) >= 5:
+        for tb, vol in zip(hist_tb[-10:], hist_vol[-10:]):
+            cvd += tb - (vol - tb) if vol > 0 else 0
+            cvd_vals.append(cvd)
+        if len(cvd_vals) >= 5:
             x = list(range(5))
-            y = cvd_values[-5:]
+            y = cvd_vals[-5:]
             n = 5
-            sum_xy = sum(x[i]*y[i] for i in range(5))
-            sum_x = sum(x)
-            sum_y = sum(y)
-            sum_x2 = sum(xi*xi for xi in x)
-            slope = (n*sum_xy - sum_x*sum_y) / (n*sum_x2 - sum_x**2) if (n*sum_x2 - sum_x**2) != 0 else 0
+            sx = sum(x); sy = sum(y)
+            sxy = sum(x[i]*y[i] for i in range(5))
+            sx2 = sum(i*i for i in x)
+            denom = n*sx2 - sx*sx
+            slope = (n*sxy - sx*sy) / denom if denom != 0 else 0
             cvd_trend = 1 if slope > 0 else -1 if slope < 0 else 0
             if cvd_trend > 0: score += 2
             elif cvd_trend < 0: score -= 2
     return score, cvd_trend
 
 # ==================================================
-# LIKIDASYON (COINGLASS)
+# EXTERNAL DATA
 # ==================================================
+async def get_heavy_data(session, symbol):
+    funding = 0.0; oi_change = 0.0; ls = 1.0
+    f = await fetch_json(session, "/fapi/v1/premiumIndex", {"symbol": symbol})
+    if f: funding = float(f.get("lastFundingRate", 0))
+    oi = await fetch_json(session, "/futures/data/openInterestHist",
+                          {"symbol": symbol, "period": "5m", "limit": 2})
+    if oi and len(oi) >= 2:
+        prev = float(oi[-2]["sumOpenInterest"])
+        curr = float(oi[-1]["sumOpenInterest"])
+        if prev > 0: oi_change = (curr - prev) / prev * 100
+    r = await fetch_json(session, "/futures/data/topLongShortPositionRatio",
+                         {"symbol": symbol, "period": "5m", "limit": 1})
+    if r:
+        try: ls = float(r[-1]["longShortRatio"])
+        except: pass
+    return funding, oi_change, ls
+
 async def get_liquidation_data(session, symbol):
-    if not COINGLASS_API_KEY:
-        return None, None
+    if not COINGLASS_API_KEY: return None, None
     try:
-        url = "https://open-api.coinglass.com/public/v2/liquidation"
-        params = {"symbol": symbol.replace("USDT", ""), "time_type": "1"}
         headers = {"coinglassSecret": COINGLASS_API_KEY}
-        async with session.get(url, params=params, headers=headers, timeout=10) as resp:
-            if resp.status != 200:
-                return None, None
-            data = await resp.json()
-            if data.get("code") == "0" and data.get("data"):
-                items = data["data"]["liquidationList"]
-                long_liq = sum(float(item.get("longVolUsd",0)) for item in items)
-                short_liq = sum(float(item.get("shortVolUsd",0)) for item in items)
-                return long_liq, short_liq
-    except:
-        pass
+        params = {"symbol": symbol.replace("USDT",""), "time_type": "1"}
+        async with aiohttp.ClientSession() as cs:
+            async with cs.get("https://open-api.coinglass.com/public/v2/liquidation",
+                              params=params, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("code") == "0":
+                        items = data["data"]["liquidationList"]
+                        long_liq = sum(float(it["longVolUsd"]) for it in items)
+                        short_liq = sum(float(it["shortVolUsd"]) for it in items)
+                        return long_liq, short_liq
+    except: pass
     return None, None
 
 # ==================================================
-# ADAPTIF VOLATILITE
+# ADAPTIVE VOLATILITY
 # ==================================================
 def calc_volatility_factor(closes):
-    if len(closes) < 20:
-        return 1.0
+    if len(closes) < 20: return 1.0
     returns = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
     vol = stdev(returns) if len(returns) > 1 else 0
-    base_vol = 0.005
-    factor = vol / base_vol if base_vol > 0 else 1
+    base = 0.005
+    factor = vol / base if base > 0 else 1
     return min(max(factor, 0.7), 1.4)
 
 # ==================================================
-# HEAVY DATA
-# ==================================================
-async def get_heavy_data(session, symbol):
-    funding = 0
-    oi_change = 0
-    long_short = 1
-    funding_data = await fetch_json(session, "/fapi/v1/premiumIndex", {"symbol": symbol})
-    if funding_data:
-        funding = float(funding_data.get("lastFundingRate", 0))
-    oi_data = await fetch_json(session, "/futures/data/openInterestHist",
-                               {"symbol": symbol, "period": "5m", "limit": 2})
-    if oi_data and len(oi_data) >= 2:
-        prev_oi = float(oi_data[-2]["sumOpenInterest"])
-        curr_oi = float(oi_data[-1]["sumOpenInterest"])
-        if prev_oi > 0:
-            oi_change = ((curr_oi - prev_oi) / prev_oi) * 100
-    ratio_data = await fetch_json(session, "/futures/data/topLongShortPositionRatio",
-                                  {"symbol": symbol, "period": "5m", "limit": 1})
-    if ratio_data:
-        try:
-            long_short = float(ratio_data[-1]["longShortRatio"])
-        except:
-            pass
-    return funding, oi_change, long_short
-
-# ==================================================
-# SINIFLANDIRMA (floor kontrolü)
+# CLASSIFY
 # ==================================================
 def classify_signal(score, vol_factor=1.0, use_floor=True):
     if use_floor:
@@ -273,418 +224,288 @@ def classify_signal(score, vol_factor=1.0, use_floor=True):
         strong = 13 * vol_factor
         medium = 8 * vol_factor
         weak = 5 * vol_factor
-    if score >= strong:
-        return "🔥 GÜÇLÜ AL"
-    if score >= medium:
-        return "🟡 ORTA AL"
-    if score >= weak:
-        return "🟢 AZ AL"
+    if score >= strong: return "🔥 GÜÇLÜ"
+    if score >= medium: return "🟡 ORTA"
+    if score >= weak: return "🟢 ZAYIF"
     return None
 
 # ==================================================
-# SEMBOL LISTESI
+# RISK ENGINE
+# ==================================================
+def risk_engine(pnl):
+    global equity, daily_pnl, consecutive_losses, trading_paused
+    equity += pnl
+    daily_pnl += pnl
+    if pnl < 0:
+        consecutive_losses += 1
+    else:
+        consecutive_losses = 0
+    if daily_pnl < -80 or equity < balance * 0.85 or consecutive_losses >= 5:
+        trading_paused = True
+
+def evolve(pnl):
+    global weights
+    if pnl > 0:
+        for k in weights: weights[k] *= 1.01
+    else:
+        weights["trend"] *= 0.99
+        weights["whale"] *= 0.99
+    for k in weights:
+        weights[k] = max(0.4, min(weights[k], 2.5))
+
+# ==================================================
+# BTC BIAS
+# ==================================================
+async def get_btc_bias(session):
+    kl = await fetch_json(session, "/fapi/v1/klines", {"symbol":"BTCUSDT","interval":"15m","limit":50})
+    if not kl: return "NEUTRAL"
+    c = [float(k[4]) for k in kl]
+    e20 = ema(c, 20); e50 = ema(c, 50)
+    if not e20 or not e50: return "NEUTRAL"
+    if c[-1] > e20 > e50: return "BULLISH"
+    if c[-1] < e20 < e50: return "BEARISH"
+    return "NEUTRAL"
+
+# ==================================================
+# SYMBOLS
 # ==================================================
 async def get_all_symbols(session):
-    futures_symbols = []
-    try:
-        fut_info = await fetch_json(session, "/fapi/v1/exchangeInfo")
-        if fut_info:
-            for s in fut_info.get("symbols", []):
-                if s.get("contractType") == "PERPETUAL" and s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
-                    futures_symbols.append(s["symbol"])
-    except:
-        pass
-    return futures_symbols
+    info = await fetch_json(session, "/fapi/v1/exchangeInfo")
+    if not info: return []
+    return [s["symbol"] for s in info["symbols"]
+            if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
 
 # ==================================================
-# COIN TARAMA (CANLI) – DOKUNMADIM
+# SCAN (HIBRIT)
 # ==================================================
-async def scan_coin(session, symbol, btc_bias, semaphore):
-    async with semaphore:
+async def scan_coin(session, symbol, btc_bias, sem):
+    global trading_paused
+    async with sem:
+        if trading_paused: return
         try:
-            klines_5m = await fetch_json(session, "/fapi/v1/klines",
-                                         {"symbol": symbol, "interval": "5m", "limit": 80})
-            if not klines_5m:
+            kl = await fetch_json(session, "/fapi/v1/klines",
+                                  {"symbol": symbol, "interval": "5m", "limit": 80})
+            if not kl: return
+            kl_1h = await fetch_json(session, "/fapi/v1/klines",
+                                     {"symbol": symbol, "interval": "1h", "limit": 80})
+
+            c = [float(k[4]) for k in kl]
+            h = [float(k[2]) for k in kl]
+            l = [float(k[3]) for k in kl]
+            v = [float(k[5]) for k in kl]
+            tb = [float(k[9]) for k in kl]
+
+            last = kl[-2]
+            open_p = float(last[1]); close_p = float(last[4])
+            vol = float(last[5]); tbuy = float(last[9])
+            change = (close_p - open_p) / open_p * 100
+
+            vm = mean(v); vs = stdev(v) if len(v) > 1 else 0
+            vz = (vol - vm) / vs if vs > 0 else 0
+
+            vol_factor = calc_volatility_factor(c)
+            if abs(change) < 0.25 * vol_factor and vz < 0.8 * vol_factor:
                 return
 
-            klines_1h = await fetch_json(session, "/fapi/v1/klines",
-                                         {"symbol": symbol, "interval": "1h", "limit": 80})
+            regime = detect_regime(c, v)
+            sw_up, sw_down = detect_sweep(h, l, c)
 
-            closes = []; highs = []; lows = []; volumes = []; taker_buys = []
-            for k in klines_5m:
-                closes.append(float(k[4]))
-                highs.append(float(k[2]))
-                lows.append(float(k[3]))
-                volumes.append(float(k[5]))
-                taker_buys.append(float(k[9]))
+            atr_val = atr(h, l, c) or close_p * 0.005
+            comp, break_up, break_down = sideways_breakout(c, atr_val)
 
-            last = klines_5m[-2]
-            open_price = float(last[1])
-            close_price = float(last[4])
-            volume = float(last[5])
-            taker_buy = float(last[9])
-            change = ((close_price - open_price) / open_price) * 100
+            funding, oi_ch, ls = await get_heavy_data(session, symbol)
+            liq_l, liq_s = await get_liquidation_data(session, symbol)
 
-            vol_mean = mean(volumes)
-            vol_std = stdev(volumes) if len(volumes) > 1 else 0
-            vol_z = ((volume - vol_mean) / vol_std) if vol_std > 0 else 0
+            of_score, cvd_trend = orderflow_strength(vol, tbuy, tb, v)
 
-            vol_factor = calc_volatility_factor(closes)
+            # 1H trend bonus
+            bonus_l = bonus_s = 0
+            if kl_1h:
+                c1 = [float(k[4]) for k in kl_1h]
+                e20 = ema(c1, 20); e50 = ema(c1, 50)
+                if e20 and e50:
+                    if c1[-1] > e20 > e50: bonus_l += 3
+                    if c1[-1] < e20 < e50: bonus_s += 3
 
-            min_change = 0.25 * vol_factor
-            min_vol_z = 0.8 * vol_factor
-            if abs(change) < min_change and vol_z < min_vol_z:
-                return
-
-            regime = detect_regime(closes, volumes)
-            sweep_up, sweep_down = detect_sweep(highs, lows, closes)
-
-            atr_val = calculate_atr(highs, lows, closes)
-            if atr_val is None:
-                atr_val = close_price * 0.005
-
-            compressed, breakout_up, breakout_down = sideways_breakout(closes, atr_val)
-
-            funding, oi_change, long_short = await get_heavy_data(session, symbol)
-            long_liq, short_liq = await get_liquidation_data(session, symbol)
-
-            order_score, cvd_trend = orderflow_strength(volume, taker_buy, taker_buys, volumes)
-
-            trend_bonus_long = 0
-            trend_bonus_short = 0
-            if klines_1h:
-                closes_1h = [float(k[4]) for k in klines_1h]
-                ema20_1h = ema(closes_1h, 20)
-                ema50_1h = ema(closes_1h, 50)
-                last_1h = closes_1h[-1]
-                if ema20_1h and ema50_1h:
-                    if last_1h > ema20_1h and ema20_1h > ema50_1h:
-                        trend_bonus_long += 3
-                    if last_1h < ema20_1h and ema20_1h < ema50_1h:
-                        trend_bonus_short += 3
-
+            # SCORING (hibrit ağırlıklarla)
             long_score = 0
             short_score = 0
 
-            if change > 1: long_score += 2
-            if change < -1: short_score += 2
+            # trend ağırlığı
+            if change > 1: long_score += 2 * weights["trend"]
+            if change < -1: short_score += 2 * weights["trend"]
 
-            if vol_z > 2 * vol_factor:
-                long_score += 2
-                short_score += 2
+            # volume
+            if vz > 2 * vol_factor:
+                long_score += 2 * weights["volume"]
+                short_score += 2 * weights["volume"]
 
+            # regime
             if regime == "TREND":
-                long_score += 1
-                short_score += 1
+                long_score += 1 * weights["regime"]
+                short_score += 1 * weights["regime"]
 
-            if sweep_down: long_score += 3
-            if sweep_up: short_score += 3
+            # sweep
+            if sw_down: long_score += 3 * weights["whale"]
+            if sw_up: short_score += 3 * weights["whale"]
 
-            if oi_change > 4:
+            # OI, funding
+            if oi_ch > 4:
                 long_score += 3
                 short_score += 3
-
             if funding < -0.01 and change > 0: long_score += 3
             if funding > 0.01 and change < 0: short_score += 3
 
-            if long_short > 1.5: short_score += 1
-            if long_short < 0.7: long_score += 1
+            # long/short ratio
+            if ls > 1.5: short_score += 1
+            if ls < 0.7: long_score += 1
 
-            if compressed and breakout_up: long_score += 3
-            if compressed and breakout_down: short_score += 3
+            # breakout
+            if comp and break_up: long_score += 3 * weights["breakout"]
+            if comp and break_down: short_score += 3 * weights["breakout"]
 
-            if order_score > 0: long_score += order_score
-            if order_score < 0: short_score += abs(order_score)
-
-            long_score += trend_bonus_long
-            short_score += trend_bonus_short
-
-            if btc_bias == "BULLISH":
-                long_score += 2
-                short_score -= 1
-            if btc_bias == "BEARISH":
-                short_score += 2
-                long_score -= 1
-
-            if long_liq and short_liq:
-                if long_liq > short_liq * 1.3: long_score += 2
-                if short_liq > long_liq * 1.3: short_score += 2
-
+            # orderflow & CVD
+            if of_score > 0: long_score += of_score
+            if of_score < 0: short_score += abs(of_score)
             if cvd_trend > 0: long_score += 2
-            elif cvd_trend < 0: short_score += 2
+            if cvd_trend < 0: short_score += 2
 
-            best_score = max(long_score, short_score)
-            signal_type = classify_signal(best_score, vol_factor, use_floor=True)
-            if not signal_type:
-                return
+            long_score += bonus_l
+            short_score += bonus_s
+
+            # BTC bias
+            if btc_bias == "BULLISH": long_score += 2; short_score -= 1
+            if btc_bias == "BEARISH": short_score += 2; long_score -= 1
+
+            # liquidation
+            if liq_l and liq_s:
+                if liq_l > liq_s * 1.3: long_score += 2
+                if liq_s > liq_l * 1.3: short_score += 2
+
+            best = max(long_score, short_score)
+            sig = classify_signal(best, vol_factor, use_floor=True)
+            if not sig: return
 
             direction = "LONG" if long_score > short_score else "SHORT"
 
-            if btc_bias == "BULLISH" and direction == "SHORT" and best_score < 11:
-                return
-            if btc_bias == "BEARISH" and direction == "LONG" and best_score < 11:
-                return
+            if btc_bias == "BULLISH" and direction == "SHORT" and best < 11: return
+            if btc_bias == "BEARISH" and direction == "LONG" and best < 11: return
 
             now = time.time()
-            if symbol in last_signal:
-                if now - last_signal[symbol] < COOLDOWN:
-                    return
+            if symbol in last_signal and now - last_signal[symbol] < COOLDOWN: return
             last_signal[symbol] = now
 
-            confidence = min(95, int(best_score * 6))
-            icon = "🟢" if direction == "LONG" else "🔴"
-            expected_move = "%1-3"
-            if best_score >= 8: expected_move = "%3-6"
-            if best_score >= 13: expected_move = "%5-10"
+            # PnL simülasyonu (gerçekçi değil ama risk motoru için)
+            pnl = (best - 10) * 0.5
+            risk_engine(pnl)
+            evolve(pnl)
 
-            sl_atr_mult = 1.5
-            tp_atr_mult = 2.0
-            if direction == "LONG":
-                stop_loss_price = close_price - atr_val * sl_atr_mult
-                take_profit_price = close_price + atr_val * tp_atr_mult
-            else:
-                stop_loss_price = close_price + atr_val * sl_atr_mult
-                take_profit_price = close_price - atr_val * tp_atr_mult
+            # Stop/tp
+            sl = close_p - atr_val * 1.5 if direction == "LONG" else close_p + atr_val * 1.5
+            tp = close_p + atr_val * 2.0 if direction == "LONG" else close_p - atr_val * 2.0
 
-            capital = 1000.0
-            risk_percent = 0.01
-            risk_amount = capital * risk_percent
-            stop_loss_pct = abs(close_price - stop_loss_price) / close_price
-            if stop_loss_pct > 0:
-                position_size = risk_amount / (stop_loss_pct * close_price)
-            else:
-                position_size = 0.0
-
-            reasons = []
-            if vol_z > 2: reasons.append("Hacim Patlaması")
-            if oi_change > 4: reasons.append("OI Yükselişi")
-            if compressed: reasons.append("Yatay Kırılım")
-            if sweep_down and direction == "LONG": reasons.append("Dip Sweep")
-            if sweep_up and direction == "SHORT": reasons.append("Tepe Sweep")
-            if funding < -0.01 and direction == "LONG": reasons.append("Short Squeeze")
-            if funding > 0.01 and direction == "SHORT": reasons.append("Long Squeeze")
-            if trend_bonus_long > 0 and direction == "LONG": reasons.append("1H Trend Güçlü")
-            if trend_bonus_short > 0 and direction == "SHORT": reasons.append("1H Trend Güçlü")
-            if btc_bias == "BULLISH": reasons.append("BTC Güçlü")
-            if btc_bias == "BEARISH": reasons.append("BTC Zayıf")
-            if long_liq and short_liq and ((long_liq > short_liq*1.3) or (short_liq > long_liq*1.3)):
-                reasons.append("Likidasyon Dengesizliği")
-            if cvd_trend > 0 and direction == "LONG": reasons.append("CVD Yükseliş")
-            if cvd_trend < 0 and direction == "SHORT": reasons.append("CVD Düşüş")
-            if len(reasons) == 0: reasons.append("Momentum")
-
-            reason_text = "\n".join("• " + r for r in reasons)
-
-            msg = (
-                f"{signal_type}\n\n"
-                f"{icon} {symbol}\n\n"
-                f"Yön: {direction}\n"
-                f"Güven: %{confidence}\n\n"
-                f"📊 Risk Yönetimi (örnek 1000 USDT):\n"
-                f"Stop‑Loss: {stop_loss_price:.4f} USDT\n"
-                f"Take‑Profit: {take_profit_price:.4f} USDT\n"
-                f"Pozisyon Büyüklüğü: {position_size:.2f} adet\n\n"
-                f"Tahmini Hareket: {expected_move}\n\n"
-                f"Sebep:\n{reason_text}"
-            )
+            msg = f"{sig} {symbol} {direction}\nTP:{tp:.4f} SL:{sl:.4f}\nScore:{best}"
             print(msg)
             await send_telegram(msg)
 
         except Exception as e:
-            logging.error(f"SCAN ERROR {symbol}: {traceback.format_exc()}")
-            print("SCAN ERROR:", symbol, e)
+            logging.error(f"SCAN {symbol}: {traceback.format_exc()}")
 
 # ==================================================
-# BACKTEST (DEBUGLU)
+# BACKTEST (esnek, CVD'li)
 # ==================================================
 async def run_backtest(session):
     try:
-        await send_telegram("📊 BACKTEST BAŞLATILIYOR...")
+        await send_telegram("📊 BACKTEST BAŞLADI")
+        syms = await get_all_symbols(session)
+        test = syms[:200]
+        total = wins = 0
+        pnl_net = 0.0
+        comm = 0.0004; slip = 0.0002
 
-        # API erişim testi
-        test_kl = await fetch_json(session, "/fapi/v1/klines",
-                                   {"symbol": "BTCUSDT", "interval": "5m", "limit": 5})
-        if test_kl is None:
-            await send_telegram("❌ fetch_json() başarısız, logları kontrol et.")
-        else:
-            await send_telegram(f"✅ API çalışıyor. BTCUSDT: {float(test_kl[-1][4])}")
+        for sym in test:
+            kl = await fetch_json(session, "/fapi/v1/klines",
+                                  {"symbol": sym, "interval": "5m", "limit": 1000})
+            if not kl or len(kl) < 50: continue
+            for i in range(200, len(kl)-1):
+                win = kl[i-49:i+1] if i >= 49 else kl[:i+1]
+                if len(win) < 30: continue
+                c = [float(k[4]) for k in win]; h = [float(k[2]) for k in win]
+                l = [float(k[3]) for k in win]; v = [float(k[5]) for k in win]
+                tb = [float(k[9]) for k in win]
+                last = win[-1]; op = float(last[1]); cp = float(last[4])
+                vol = float(last[5]); tbuy = float(last[9])
+                change = (cp - op) / op * 100
+                if vol <= 0 or abs(change) < 0.1: continue
 
-        all_syms = await get_all_symbols(session)
-        await send_telegram(f"📋 Toplam futures sembol: {len(all_syms)}")
-        if len(all_syms) == 0:
-            await send_telegram("❌ Sembol listesi boş!")
-            return
+                regime = detect_regime(c, v)
+                sw_up, sw_down = detect_sweep(h, l, c)
+                atr_val = atr(h, l, c) or cp * 0.005
+                comp, bu, bd = sideways_breakout(c, atr_val)
+                of, cvd = orderflow_strength(vol, tbuy, tb, v)
 
-        test_symbols = all_syms[:200]
-        total_signals = 0
-        wins = 0
-        total_pnl_net = 0.0
+                long = short = 0
+                if change > 0.5: long += 1
+                if change < -0.5: short += 1
+                if sw_down: long += 2
+                if sw_up: short += 2
+                if comp and bu: long += 2
+                if comp and bd: short += 2
+                if of > 0: long += of
+                if of < 0: short += abs(of)
+                if cvd > 0: long += 1
+                if cvd < 0: short += 1
+                if regime == "TREND": long += 1; short += 1
 
-        commission = 0.0004
-        slippage = 0.0002
+                best = max(long, short)
+                sig = classify_signal(best, 0.2, use_floor=False)
+                if not sig: continue
 
-        for symbol in test_symbols:
-            klines = await fetch_json(session, "/fapi/v1/klines",
-                                      {"symbol": symbol, "interval": "5m", "limit": 1000})
-            if not klines or len(klines) < 50:
-                continue
-
-            sym_signals = 0
-            for i in range(200, len(klines)-1):
-                window = klines[i-49:i+1] if i >= 49 else klines[:i+1]
-                if len(window) < 30:
-                    continue
-
-                closes = [float(k[4]) for k in window]
-                highs = [float(k[2]) for k in window]
-                lows = [float(k[3]) for k in window]
-                volumes = [float(k[5]) for k in window]
-                taker_buys = [float(k[9]) for k in window]
-
-                last = window[-1]
-                open_price = float(last[1])
-                close_price = float(last[4])
-                volume = float(last[5])
-                taker_buy = float(last[9])
-                change = ((close_price - open_price) / open_price) * 100
-
-                if volume <= 0:
-                    continue
-
-                if abs(change) < 0.1:
-                    continue
-
-                regime = detect_regime(closes, volumes)
-                sweep_up, sweep_down = detect_sweep(highs, lows, closes)
-
-                atr_val = calculate_atr(highs, lows, closes)
-                if atr_val is None:
-                    atr_val = close_price * 0.005
-                compressed, breakout_up, breakout_down = sideways_breakout(closes, atr_val)
-
-                order_score, cvd_trend = orderflow_strength(volume, taker_buy, taker_buys, volumes)
-
-                long_score = 0
-                short_score = 0
-
-                if change > 0.5: long_score += 1
-                if change < -0.5: short_score += 1
-
-                if sweep_down: long_score += 2
-                if sweep_up: short_score += 2
-
-                if compressed and breakout_up: long_score += 2
-                if compressed and breakout_down: short_score += 2
-
-                if order_score > 0: long_score += order_score
-                if order_score < 0: short_score += abs(order_score)
-
-                if cvd_trend > 0: long_score += 1
-                elif cvd_trend < 0: short_score += 1
-
-                if regime == "TREND":
-                    long_score += 1
-                    short_score += 1
-
-                best_score = max(long_score, short_score)
-                signal_type = classify_signal(best_score, 0.2, use_floor=False)
-                if not signal_type:
-                    continue
-
-                direction = "LONG" if long_score > short_score else "SHORT"
-                entry = close_price
-
-                if direction == "LONG":
-                    tp = entry + atr_val * 2.0
-                    sl = entry - atr_val * 1.5
-                else:
-                    tp = entry - atr_val * 2.0
-                    sl = entry + atr_val * 1.5
-
-                if direction == "LONG":
-                    entry_real = entry * (1 + slippage + commission)
-                else:
-                    entry_real = entry * (1 - slippage - commission)
-
-                future_prices = [float(k[4]) for k in klines[i+1:i+31]]
-                exit_price = None
-                for price in future_prices:
-                    if direction == "LONG":
-                        if price >= tp:
-                            exit_price = tp * (1 - commission - slippage)
-                            wins += 1
-                            break
-                        elif price <= sl:
-                            exit_price = sl * (1 - commission - slippage)
-                            break
+                dir = "LONG" if long > short else "SHORT"
+                entry = cp
+                tp = entry + atr_val*2 if dir=="LONG" else entry - atr_val*2
+                sl = entry - atr_val*1.5 if dir=="LONG" else entry + atr_val*1.5
+                entry_real = entry * (1+slip+comm) if dir=="LONG" else entry * (1-slip-comm)
+                fut = [float(k[4]) for k in kl[i+1:i+31]]
+                exit_p = None
+                for p in fut:
+                    if dir=="LONG":
+                        if p >= tp: exit_p = tp*(1-comm-slip); wins += 1; break
+                        elif p <= sl: exit_p = sl*(1-comm-slip); break
                     else:
-                        if price <= tp:
-                            exit_price = tp * (1 - commission - slippage)
-                            wins += 1
-                            break
-                        elif price >= sl:
-                            exit_price = sl * (1 - commission - slippage)
-                            break
-                if exit_price is None:
-                    exit_price = entry_real
+                        if p <= tp: exit_p = tp*(1-comm-slip); wins += 1; break
+                        elif p >= sl: exit_p = sl*(1-comm-slip); break
+                if exit_p is None: exit_p = entry_real
+                pnl_net += (exit_p - entry_real) / entry_real * 100
+                total += 1
 
-                pnl = (exit_price - entry_real) / entry_real * 100
-                total_pnl_net += pnl
-                total_signals += 1
-                sym_signals += 1
-
-            print(f"{symbol}: {sym_signals} sinyal")
-
-        win_rate = (wins / total_signals * 100) if total_signals > 0 else 0
-        avg_pnl = total_pnl_net / total_signals if total_signals > 0 else 0
-        profit_factor = (total_pnl_net + wins) / (abs(total_pnl_net) + (total_signals - wins)) if total_signals > 0 else 0
-
-        msg = (f"📊 BACKTEST SONUCU\n"
-               f"Toplam Sinyal: {total_signals}\n"
-               f"Kazanan: {wins} | Kaybeden: {total_signals - wins}\n"
-               f"Win Rate: %{win_rate:.1f}\n"
-               f"Ort. Net Getiri: %{avg_pnl:.2f}\n"
-               f"Kümülatif Net PnL: %{total_pnl_net:.2f}\n"
-               f"Kâr Faktörü: {profit_factor:.2f}")
+        winrate = wins/total*100 if total else 0
+        avg = pnl_net/total if total else 0
+        pf = (pnl_net+wins)/(abs(pnl_net)+(total-wins)) if total else 0
+        msg = (f"📊 BACKTEST\nSinyal:{total} Kazan:{wins} (%{winrate:.1f})\n"
+               f"Ort.PnL:%{avg:.2f} Küm.PnL:%{pnl_net:.2f} PF:{pf:.2f}")
         await send_telegram(msg)
-
     except Exception as e:
-        logging.error(f"Backtest Error: {traceback.format_exc()}")
-        print("Backtest Error:", e)
+        logging.error(f"Backtest: {traceback.format_exc()}")
 
 # ==================================================
-# ANA DÖNGÜ (IPv4 connector ile)
+# MAIN
 # ==================================================
 async def main():
-    print("🚀 BOT BAŞLIYOR (IPv4 zorlamalı)")
-    connector = aiohttp.TCPConnector(family=2)  # 2 = AF_INET (IPv4)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        # Telegram worker'ı aynı session ile başlat
+    print("🚀 HİBRİT BOT BAŞLADI")
+    async with aiohttp.ClientSession() as session:
         asyncio.create_task(telegram_worker(session))
-        await send_telegram("✅ BOT ONLINE")
-
-        # Bağlantı testi: Binance ping
-        try:
-            async with session.get("https://api.binance.com/api/v3/ping", timeout=10) as resp:
-                if resp.status == 200:
-                    await send_telegram("🌐 Binance ping başarılı")
-                else:
-                    await send_telegram(f"⚠️ Ping başarısız: HTTP {resp.status}")
-        except Exception as e:
-            await send_telegram(f"❌ Ping hatası: {str(e)}")
-
-        all_symbols = await get_all_symbols(session)
-        print(f"Toplam futures coin: {len(all_symbols)}")
-
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        await send_telegram("✅ HİBRİT BOT ONLINE")
+        syms = await get_all_symbols(session)
+        print(f"{len(syms)} coin")
+        sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
         asyncio.create_task(run_backtest(session))
         last_backtest = time.time()
 
         while True:
-            btc_bias = await get_btc_bias(session)
-            tasks = [scan_coin(session, sym, btc_bias, semaphore) for sym in all_symbols]
+            bias = await get_btc_bias(session)
+            tasks = [scan_coin(session, sym, bias, sem) for sym in syms]
             await asyncio.gather(*tasks)
-
             if time.time() - last_backtest > 86400:
                 asyncio.create_task(run_backtest(session))
                 last_backtest = time.time()
