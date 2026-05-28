@@ -2,8 +2,19 @@ import asyncio
 import aiohttp
 import os
 import time
+import logging
+import traceback
 from statistics import mean, stdev
 from datetime import datetime, timezone, timedelta
+
+# ==================================================
+# LOG AYARLARI
+# ==================================================
+logging.basicConfig(
+    filename='bot_errors.log',
+    level=logging.ERROR,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -33,14 +44,13 @@ async def telegram_worker(session):
                 payload = {"chat_id": CHAT_ID, "text": text}
                 async with session.post(url, json=payload, timeout=10) as resp:
                     if resp.status == 429:
-                        # Rate limit aşımı -> biraz bekle ve tekrar kuyruğa ekle
                         await asyncio.sleep(1)
                         await telegram_queue.put(text)
         except Exception as e:
+            logging.error(f"TELEGRAM ERROR: {traceback.format_exc()}")
             print("TELEGRAM ERROR:", e)
         finally:
             telegram_queue.task_done()
-        # Saniyede max 3 mesaj
         await asyncio.sleep(0.35)
 
 async def send_telegram(text):
@@ -134,16 +144,15 @@ def detect_sweep(highs, lows, closes):
     return sweep_up, sweep_down
 
 # ==================================================
-# SIDEWAYS BREAKOUT (ATR dinamik eşik)
+# SIDEWAYS BREAKOUT (ATR dinamik eşik + taban değer)
 # ==================================================
 def sideways_breakout(closes, atr_val=None):
     recent = closes[-15:]
     highest = max(recent)
     lowest = min(recent)
     range_pct = ((highest - lowest) / lowest) * 100
-    # ATR varsa dinamik çarpan, yoksa sabit 0.002
     if atr_val and highest > 0:
-        factor = (atr_val / highest) * 2  # ATR'ye göre esneklik
+        factor = max((atr_val / highest) * 2, 0.001)  # floor eklendi
     else:
         factor = 0.002
     breakout_up = closes[-1] > highest * (1 - factor)
@@ -322,7 +331,6 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
             regime = detect_regime(closes, volumes)
             sweep_up, sweep_down = detect_sweep(highs, lows, closes)
 
-            # ATR değerini hesapla (sideways breakout için lazım)
             atr_val = calculate_atr(highs, lows, closes)
             if atr_val is None:
                 atr_val = close_price * 0.005
@@ -347,7 +355,6 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
                     if last_1h < ema20_1h and ema20_1h < ema50_1h:
                         trend_bonus_short += 3
 
-            # Skorlama
             long_score = 0
             short_score = 0
 
@@ -422,7 +429,6 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
             if best_score >= 8: expected_move = "%3-6"
             if best_score >= 13: expected_move = "%5-10"
 
-            # ATR ve pozisyon önerisi (aynı ATR kullanılıyor)
             sl_atr_mult = 1.5
             tp_atr_mult = 2.0
             if direction == "LONG":
@@ -477,6 +483,7 @@ async def scan_coin(session, symbol, btc_bias, semaphore):
             await send_telegram(msg)
 
         except Exception as e:
+            logging.error(f"SCAN ERROR {symbol}: {traceback.format_exc()}")
             print("SCAN ERROR:", symbol, e)
 
 # ==================================================
@@ -500,9 +507,7 @@ async def run_backtest(session):
                                       {"symbol": symbol, "interval": "5m", "limit": 1000})
             if not klines or len(klines) < 50:
                 continue
-            # Son 200 mumdan itibaren başla, kayan pencere 50 mum
             for i in range(200, len(klines)-1):
-                # Sadece son 50 mumu al (hız optimizasyonu)
                 window = klines[i-49:i+1] if i >= 49 else klines[:i+1]
                 closes = [float(k[4]) for k in window]
                 highs = [float(k[2]) for k in window]
@@ -522,7 +527,6 @@ async def run_backtest(session):
                 vol_std = stdev(volumes) if len(volumes) > 1 else 0
                 vol_z = ((volume - vol_mean) / vol_std) if vol_std > 0 else 0
 
-                # EŞİKLER DÜŞÜRÜLDÜ
                 if abs(change) < 0.15 and vol_z < 0.5:
                     continue
 
@@ -609,15 +613,15 @@ async def run_backtest(session):
                f"Kâr Faktörü: {profit_factor:.2f}")
         await send_telegram(msg)
     except Exception as e:
+        logging.error(f"Backtest Error: {traceback.format_exc()}")
         print("Backtest Error:", e)
 
 # ==================================================
 # ANA DÖNGÜ
 # ==================================================
 async def main():
-    print("🚀 PROFESIONAL BOT (200 Coin + Telegram Queue + ATR Dinamik)")
+    print("🚀 PROFESIONAL BOT (Loglama + ATR taban eklendi)")
     async with aiohttp.ClientSession() as session:
-        # Telegram worker başlat
         asyncio.create_task(telegram_worker(session))
         await send_telegram("✅ BOT ONLINE (Sadece Vadeli USDT)")
         all_symbols = await get_all_symbols(session)
