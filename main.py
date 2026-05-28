@@ -4,48 +4,51 @@ import os
 import time
 from statistics import mean, stdev
 
-# ======================================
+# =====================================================
 # ENV
-# ======================================
+# =====================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# ======================================
+# =====================================================
 # CONFIG
-# ======================================
+# =====================================================
+BASE_URL = "https://fapi.binance.com"
+
 COINS = [
     "BTCUSDT",
     "ETHUSDT",
     "SOLUSDT",
     "XRPUSDT",
+    "DOGEUSDT",
     "AVAXUSDT",
-    "ADAUSDT"
+    "ADAUSDT",
+    "LINKUSDT",
+    "WIFUSDT",
+    "SEIUSDT",
+    "SUIUSDT"
 ]
-
-BASE_URL = "https://fapi.binance.com"
 
 INTERVAL = "5m"
 
-SCAN_INTERVAL = 30
-COOLDOWN = 300
+SCAN_INTERVAL = 40
+COOLDOWN = 600
 
-USE_LIVE_TRADING = False
-
-# ======================================
+# =====================================================
 # GLOBALS
-# ======================================
+# =====================================================
 last_signal = {}
 
-# ======================================
+# =====================================================
 # TELEGRAM
-# ======================================
+# =====================================================
 async def send_telegram(session, text):
 
-    if not BOT_TOKEN or not CHAT_ID:
-        print(text)
-        return
-
     try:
+
+        if not BOT_TOKEN or not CHAT_ID:
+            print(text)
+            return
 
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
@@ -60,25 +63,20 @@ async def send_telegram(session, text):
         )
 
     except Exception as e:
-        print("Telegram Error:", e)
+        print("TELEGRAM ERROR:", e)
 
-# ======================================
-# FETCH KLINES
-# ======================================
-async def fetch_klines(
+# =====================================================
+# FETCH
+# =====================================================
+async def fetch_json(
     session,
-    symbol
+    endpoint,
+    params=None
 ):
 
     try:
 
-        url = f"{BASE_URL}/fapi/v1/klines"
-
-        params = {
-            "symbol": symbol,
-            "interval": INTERVAL,
-            "limit": 50
-        }
+        url = f"{BASE_URL}{endpoint}"
 
         async with session.get(
             url,
@@ -91,20 +89,16 @@ async def fetch_klines(
 
             return await response.json()
 
-    except Exception as e:
-        print("Fetch Error:", symbol, e)
+    except:
         return None
 
-# ======================================
-# REGIME
-# ======================================
+# =====================================================
+# MARKET REGIME
+# =====================================================
 def detect_regime(
     closes,
     volumes
 ):
-
-    if len(closes) < 20:
-        return "UNKNOWN"
 
     move = (
         closes[-1] - closes[0]
@@ -122,17 +116,17 @@ def detect_regime(
         if vol_std > 0 else 0
     )
 
-    if abs(move) < 0.003:
+    if abs(move) < 0.004:
         return "RANGE"
 
-    if abs(move) > 0.01 and vol_z > 1:
+    if abs(move) > 0.012 and vol_z > 1:
         return "TREND"
 
     return "MIXED"
 
-# ======================================
+# =====================================================
 # LIQUIDITY SWEEP
-# ======================================
+# =====================================================
 def detect_sweep(
     highs,
     lows,
@@ -151,40 +145,153 @@ def detect_sweep(
 
     return sweep_up, sweep_down
 
-# ======================================
+# =====================================================
+# SIDEWAYS COMPRESSION
+# =====================================================
+def sideways_breakout(closes):
+
+    recent = closes[-15:]
+
+    highest = max(recent)
+    lowest = min(recent)
+
+    range_pct = (
+        (highest - lowest)
+        / lowest
+    ) * 100
+
+    breakout_up = (
+        closes[-1] > highest * 0.998
+    )
+
+    breakout_down = (
+        closes[-1] < lowest * 1.002
+    )
+
+    return (
+        range_pct < 2.5,
+        breakout_up,
+        breakout_down
+    )
+
+# =====================================================
+# HEAVY DATA
+# =====================================================
+async def get_heavy_data(
+    session,
+    symbol
+):
+
+    funding = 0
+    oi_change = 0
+    long_short = 1
+
+    # FUNDING
+    funding_data = await fetch_json(
+        session,
+        "/fapi/v1/premiumIndex",
+        {"symbol": symbol}
+    )
+
+    if funding_data:
+        funding = float(
+            funding_data.get(
+                "lastFundingRate",
+                0
+            )
+        )
+
+    # OI
+    oi_data = await fetch_json(
+        session,
+        "/futures/data/openInterestHist",
+        {
+            "symbol": symbol,
+            "period": "5m",
+            "limit": 2
+        }
+    )
+
+    if oi_data and len(oi_data) >= 2:
+
+        prev_oi = float(
+            oi_data[-2]["sumOpenInterest"]
+        )
+
+        curr_oi = float(
+            oi_data[-1]["sumOpenInterest"]
+        )
+
+        if prev_oi > 0:
+
+            oi_change = (
+                (curr_oi - prev_oi)
+                / prev_oi
+            ) * 100
+
+    # LONG SHORT RATIO
+    ratio_data = await fetch_json(
+        session,
+        "/futures/data/topLongShortPositionRatio",
+        {
+            "symbol": symbol,
+            "period": "5m",
+            "limit": 1
+        }
+    )
+
+    if ratio_data:
+
+        try:
+            long_short = float(
+                ratio_data[-1]["longShortRatio"]
+            )
+        except:
+            pass
+
+    return funding, oi_change, long_short
+
+# =====================================================
 # SCORE ENGINE
-# ======================================
+# =====================================================
 def calculate_score(
     change,
     taker_ratio,
     vol_z,
     regime,
     sweep_up,
-    sweep_down
+    sweep_down,
+    funding,
+    oi_change,
+    long_short,
+    compressed,
+    breakout_up,
+    breakout_down
 ):
 
     long_score = 0
     short_score = 0
 
-    # momentum
+    # MOMENTUM
     if change > 1:
         long_score += 2
 
     if change < -1:
         short_score += 2
 
-    # taker pressure
+    # TAKER PRESSURE
     if taker_ratio > 0.60:
         long_score += 2
 
     if taker_ratio < 0.40:
         short_score += 2
 
-    # volume anomaly
-    if vol_z > 1.5:
+    # VOLUME ANOMALY
+    if vol_z > 2:
         long_score += 2
+        short_score += 2
 
-    # regime
+    # REGIME
     if regime == "TREND":
         long_score += 1
         short_score += 1
@@ -193,18 +300,57 @@ def calculate_score(
         long_score -= 1
         short_score -= 1
 
-    # liquidity
+    # SWEEP
     if sweep_down:
         long_score += 3
 
     if sweep_up:
         short_score += 3
 
+    # OI
+    if oi_change > 3:
+        long_score += 2
+        short_score += 2
+
+    # FUNDING SQUEEZE
+    if funding < -0.01 and change > 0:
+        long_score += 3
+
+    if funding > 0.01 and change < 0:
+        short_score += 3
+
+    # LONG SHORT RATIO
+    if long_short > 1.5:
+        short_score += 1
+
+    if long_short < 0.7:
+        long_score += 1
+
+    # SIDEWAYS BREAKOUT
+    if compressed and breakout_up:
+        long_score += 3
+
+    if compressed and breakout_down:
+        short_score += 3
+
     return long_score, short_score
 
-# ======================================
-# SCAN COIN
-# ======================================
+# =====================================================
+# SIGNAL TYPE
+# =====================================================
+def classify_signal(score):
+
+    if score >= 11:
+        return "🛡️ ZIRHLI"
+
+    if score >= 7:
+        return "❓ ACABA"
+
+    return None
+
+# =====================================================
+# SCAN
+# =====================================================
 async def scan_coin(
     session,
     symbol
@@ -212,9 +358,14 @@ async def scan_coin(
 
     try:
 
-        klines = await fetch_klines(
+        klines = await fetch_json(
             session,
-            symbol
+            "/fapi/v1/klines",
+            {
+                "symbol": symbol,
+                "interval": INTERVAL,
+                "limit": 50
+            }
         )
 
         if not klines:
@@ -231,6 +382,7 @@ async def scan_coin(
         close_price = float(last[4])
 
         volume = float(last[5])
+
         taker_buy = float(last[9])
 
         change = (
@@ -251,9 +403,17 @@ async def scan_coin(
         )
 
         vol_z = (
-            (volume - vol_mean) / vol_std
+            (volume - vol_mean)
+            / vol_std
             if vol_std > 0 else 0
         )
+
+        # FAST FILTER
+        if (
+            abs(change) < 0.4
+            and vol_z < 1.2
+        ):
+            return
 
         regime = detect_regime(
             closes,
@@ -266,13 +426,29 @@ async def scan_coin(
             closes
         )
 
+        compressed, breakout_up, breakout_down = sideways_breakout(
+            closes
+        )
+
+        # HEAVY FILTER
+        funding, oi_change, long_short = await get_heavy_data(
+            session,
+            symbol
+        )
+
         long_score, short_score = calculate_score(
             change,
             taker_ratio,
             vol_z,
             regime,
             sweep_up,
-            sweep_down
+            sweep_down,
+            funding,
+            oi_change,
+            long_short,
+            compressed,
+            breakout_up,
+            breakout_down
         )
 
         best_score = max(
@@ -280,7 +456,11 @@ async def scan_coin(
             short_score
         )
 
-        if best_score < 7:
+        signal_type = classify_signal(
+            best_score
+        )
+
+        if not signal_type:
             return
 
         direction = (
@@ -298,54 +478,14 @@ async def scan_coin(
 
         last_signal[symbol] = now
 
+        confidence = min(
+            95,
+            int(best_score * 7)
+        )
+
         msg = (
-            f"{'🟢' if direction == 'LONG' else '🔴'} "
-            f"{symbol}\n"
+            f"{signal_type}\n\n"
+            f"{'🟢' if direction=='LONG' else '🔴'} "
+            f"{symbol}\n\n"
             f"Direction: {direction}\n"
-            f"Score: {best_score}\n"
-            f"Change: %{round(change,2)}\n"
-            f"Vol Z: {round(vol_z,2)}\n"
-            f"Regime: {regime}\n"
-            f"Mode: PAPER"
-        )
-
-        print(msg)
-
-        await send_telegram(
-            session,
-            msg
-        )
-
-    except Exception as e:
-        print("SCAN ERROR:", symbol, e)
-
-# ======================================
-# MAIN
-# ======================================
-async def main():
-
-    print("🚀 BOT STARTED")
-
-    async with aiohttp.ClientSession() as session:
-
-        while True:
-
-            tasks = [
-                scan_coin(
-                    session,
-                    coin
-                )
-                for coin in COINS
-            ]
-
-            await asyncio.gather(*tasks)
-
-            await asyncio.sleep(
-                SCAN_INTERVAL
-            )
-
-# ======================================
-# START
-# ======================================
-if __name__ == "__main__":
-    asyncio.run(main())
+            f"Score: {
