@@ -1,180 +1,235 @@
 import asyncio
 import aiohttp
 import time
-from datetime import datetime
-from statistics import mean, median
+import os
+from statistics import mean, stdev
 
-# =========================================================
-# AYARLAR (Tokenlar direkt)
-# =========================================================
-BOT_TOKEN = "8728951395:AAHLIgnGKxddfAJFkfQxm8t0bsnTnAJNYZU"
-CHAT_ID = "6637406938"
+# =========================
+# ENV
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+BINANCE_KEY = os.getenv("BINANCE_KEY")
+BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 
-# TEST İÇİN SADECE BTCUSDT
-COIN_LIST = ["BTCUSDT"]
+FAPI = "https://fapi.binance.com"
 
-FAPI_URL = "https://fapi.binance.com"
-SPOT_URL = "https://api.binance.com"
+# =========================
+# CONFIG
+# =========================
+COINS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","ADAUSDT","AVAXUSDT"]
 
-CACHE_DURATION = 30
-COOLDOWN = 30
-MAX_POSSIBLE_SCORE = 28
-SEMAPHORE = asyncio.Semaphore(15)
+SCAN_INTERVAL = 20
+COOLDOWN = 300
 
-cache = {"funding": {}, "atr": {}}
-last_signals = {}
-signal_memory = {}
+MAX_RISK_PER_TRADE = 0.02   # %2 risk
+DAILY_LOSS_LIMIT = 0.05     # %5 stop
 
-# =========================================================
+last_signal = {}
+trade_memory = []
+
+sem = asyncio.Semaphore(10)
+
+# =========================
+# ACCOUNT SIMULATION (paper logic)
+# =========================
+equity = 1000
+daily_pnl = 0
+
+# =========================
 # TELEGRAM
-# =========================================================
-async def send_telegram(session, coin, signal_type):
-    try:
-        emoji = "🟢" if signal_type["direction"] == "LONG" else "🔴"
-        squeeze_tag = "🔥 SQUEEZE " if signal_type.get("squeeze") else ""
-        msg = (f"{emoji} *{squeeze_tag}{coin['symbol']} ({signal_type['direction']})*\n"
-               f"⭐ Skor: {coin['score']} | Güven: %{coin['confidence']}\n"
-               f"💵 Fiyat: {coin['price']} | %{coin['change']}")
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        await session.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-    except Exception as e:
-        print(f"Telegram hatası: {e}")
+# =========================
+async def send(session, msg):
+    if not BOT_TOKEN:
+        print(msg)
+        return
 
-# =========================================================
-# API
-# =========================================================
-async def fetch(session, url_type, endpoint, params=None):
-    base = FAPI_URL if url_type == "fapi" else SPOT_URL
     try:
-        print(f"🔄 API isteği atılıyor: {endpoint} {params}")
-        async with SEMAPHORE:
-            async with session.get(f"{base}{endpoint}", params=params, timeout=10) as resp:
-                if resp.status != 200:
-                    print(f"⚠️ API Hatası: {resp.status}")
-                    return None
-                return await resp.json()
-    except Exception as e:
-        print(f"❌ API Bağlantı Hatası: {e}")
+        await session.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg}
+        )
+    except:
+        pass
+
+# =========================
+# FETCH
+# =========================
+async def fetch(session, url, params=None):
+    try:
+        async with sem:
+            async with session.get(url, params=params, timeout=10) as r:
+                return await r.json()
+    except:
         return None
 
-async def get_cached(session, cache_name, symbol, endpoint, params):
-    now = time.time()
-    if symbol in cache[cache_name] and now - cache[cache_name][symbol]["time"] < CACHE_DURATION:
-        return cache[cache_name][symbol]["data"]
-    data = await fetch(session, "fapi", endpoint, params)
-    if data:
-        cache[cache_name][symbol] = {"time": now, "data": data}
-    return data
+# =========================
+# REGIME
+# =========================
+def regime(closes, vols):
+    if len(closes) < 20:
+        return "UNKNOWN"
 
-def calculate_ema(prices, period):
-    if len(prices) < period: return None
-    multiplier = 2 / (period + 1)
-    ema = sum(prices[:period]) / period
-    for p in prices[period:]: ema = (p - ema) * multiplier + ema
-    return ema
+    ret = (closes[-1] - closes[0]) / closes[0]
+    vol = stdev(vols) if len(vols) > 1 else 0
 
-async def get_atr(session, symbol, period=14):
-    now = time.time()
-    if symbol in cache["atr"] and now - cache["atr"][symbol]["time"] < 60:
-        return cache["atr"][symbol]["data"]
-    klines = await fetch(session, "fapi", "/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": period + 1})
-    if not klines: return 0.001
-    tr_values = []
-    for i in range(1, len(klines)):
-        high, low, prev_close = float(klines[i][2]), float(klines[i][3]), float(klines[i-1][4])
-        tr_values.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
-    atr = mean(tr_values) if tr_values else 0.001
-    cache["atr"][symbol] = {"time": now, "data": atr}
-    return atr
+    if abs(ret) < 0.002 and vol < mean(vols):
+        return "RANGE"
+    if abs(ret) > 0.01:
+        return "TREND"
+    return "MIXED"
 
-# =========================================================
-# SCAN COIN (Basitleştirilmiş, sadece BTCUSDT)
-# =========================================================
-async def scan_coin(session, symbol, market_median, min_score_atr):
+# =========================
+# RISK ENGINE (NEW)
+# =========================
+def position_size(score):
+    base = equity * MAX_RISK_PER_TRADE
+    multiplier = min(score / 10, 1.5)
+    return base * multiplier
+
+def risk_check():
+    if abs(daily_pnl) > equity * DAILY_LOSS_LIMIT:
+        return False
+    return True
+
+# =========================
+# SCORING (SMART MONEY)
+# =========================
+def score(change, vol_z, taker, reg, sweep):
+    L, S = 0, 0
+
+    if change > 1: L += 2
+    if change < -1: S += 2
+
+    if vol_z > 1.5: L += 2
+    if vol_z < -1.5: S += 2
+
+    if taker > 0.6: L += 2
+    if taker < 0.4: S += 2
+
+    if reg == "TREND":
+        L += 1; S += 1
+
+    if sweep == "DOWN":
+        L += 3
+    if sweep == "UP":
+        S += 3
+
+    return L, S
+
+# =========================
+# EXECUTION ENGINE (PAPER / READY FOR LIVE)
+# =========================
+async def execute_trade(session, symbol, direction, size):
+    global equity, daily_pnl
+
+    # ⚠️ PAPER MODE (no real trade)
+    pnl = size * 0.01  # fake outcome simulation
+
+    if direction == "LONG":
+        equity += pnl
+    else:
+        equity += pnl
+
+    daily_pnl += pnl
+
+    trade_memory.append({
+        "symbol": symbol,
+        "direction": direction,
+        "pnl": pnl
+    })
+
+    msg = f"EXECUTED {symbol} {direction} | PnL: {pnl:.2f} | Equity: {equity:.2f}"
+    await send(session, msg)
+
+# =========================
+# SCAN
+# =========================
+async def scan(session, symbol):
     try:
-        print(f"\n🔍 Taranıyor: {symbol}")
-        if symbol in last_signals and time.time() - last_signals[symbol] < COOLDOWN:
-            print("  -> Cooldown'da")
+        kl = await fetch(session, f"{FAPI}/fapi/v1/klines",
+                         {"symbol": symbol, "interval": "5m", "limit": 50})
+
+        if not kl:
             return None
 
-        # KLİNES ÇEKME (5m, 1h, 4h, 15m)
-        kl_5m = await fetch(session, "fapi", "/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": 8})
-        if not kl_5m: print("  -> 5m verisi yok!"); return None
-        print(f"  -> 5m verisi alındı, mum sayısı: {len(kl_5m)}")
+        closes = [float(k[4]) for k in kl]
+        vols = [float(k[5]) for k in kl]
+        highs = [float(k[2]) for k in kl]
+        lows = [float(k[3]) for k in kl]
 
-        kl_1h = await fetch(session, "fapi", "/fapi/v1/klines", {"symbol": symbol, "interval": "1h", "limit": 30})
-        if not kl_1h: print("  -> 1h verisi yok!"); return None
+        last = kl[-2]
 
-        kl_4h = await fetch(session, "fapi", "/fapi/v1/klines", {"symbol": symbol, "interval": "4h", "limit": 55})
-        if not kl_4h: print("  -> 4h verisi yok!"); return None
+        open_p = float(last[1])
+        close_p = float(last[4])
+        vol = float(last[5])
+        taker = float(last[9])
 
-        kl_15m = await fetch(session, "fapi", "/fapi/v1/klines", {"symbol": symbol, "interval": "15m", "limit": 6})
-        if not kl_15m: print("  -> 15m verisi yok!"); return None
+        change = ((close_p - open_p) / open_p) * 100
 
-        # BURAYA KADAR GELDİYSE VERİ VAR DEMEKTİR
-        print("✅ Tüm veriler alındı!")
+        v_mean = mean(vols)
+        v_std = stdev(vols) if len(vols) > 1 else 0
+        vol_z = (vol - v_mean) / v_std if v_std else 0
 
-        # Basit bir skor hesapla (Test için)
-        last = kl_5m[-2]
-        close_price = float(last[4])
-        volume = float(last[5])
-        taker_buy = float(last[9])
-        change_pct = ((float(last[4]) - float(last[1])) / float(last[1])) * 100
-        taker_ratio = taker_buy / volume if volume > 0 else 0
+        reg = regime(closes, vols)
 
-        # Skor (TEST - Çok düşük eşik)
-        score = 0
-        if taker_ratio > 0.50: score += 3
-        if volume > 1000000: score += 2
+        sweep_up = highs[-1] > max(highs[-10:-1]) and closes[-1] < highs[-1]
+        sweep_down = lows[-1] < min(lows[-10:-1]) and closes[-1] > lows[-1]
 
-        print(f"  -> Hesaplanan Skor: {score}")
+        L, S = score(change, vol_z, taker/vol if vol else 0, reg,
+                      "DOWN" if sweep_down else "UP" if sweep_up else "NONE")
 
-        # EŞİK (TEST İÇİN 2)
-        if score >= 2: # min_score_atr'yi 2 olarak varsay
-            print("🎯 Eşik geçildi!")
-            result = {"symbol": symbol, "direction": "LONG", "score": score, "confidence": 80,
-                      "price": round(close_price, 4), "change": round(change_pct, 2), "oi": 0,
-                      "funding": 0, "delta": 0, "rel_vol": 0, "trend": "Bullish", "risk": "LOW", "squeeze": False}
-            return result
-        else:
-            print("  -> Skor eşiği geçemedi.")
+        if max(L, S) < 7:
             return None
 
-    except Exception as e:
-        print(f"❌ Scan coin hatası ({symbol}): {e}")
+        direction = "LONG" if L > S else "SHORT"
+        final_score = max(L, S)
+
+        # cooldown
+        now = time.time()
+        if symbol in last_signal and now - last_signal[symbol] < COOLDOWN:
+            return None
+
+        last_signal[symbol] = now
+
+        # RISK CHECK
+        if not risk_check():
+            return None
+
+        size = position_size(final_score)
+
+        # EXECUTE (paper)
+        await execute_trade(session, symbol, direction, size)
+
+        return {
+            "symbol": symbol,
+            "score": final_score,
+            "direction": direction,
+            "regime": reg
+        }
+
+    except:
         return None
 
-# =========================================================
-# MAIN
-# =========================================================
+# =========================
+# MAIN LOOP
+# =========================
 async def main():
-    print("🚀 TEST MODU BAŞLATILDI (SADCE BTCUSDT)")
-    connector = aiohttp.TCPConnector(limit=100)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    print("V11 INSTITUTIONAL ENGINE STARTED")
+
+    async with aiohttp.ClientSession() as session:
         while True:
-            try:
-                print(f"\n--- {datetime.now().strftime('%H:%M:%S')} ---")
+            tasks = [scan(session, c) for c in COINS]
+            res = await asyncio.gather(*tasks)
 
-                # MARKET MEDIAN
-                tasks = [fetch(session, "fapi", "/fapi/v1/klines", {"symbol": sym, "interval": "5m", "limit": 5}) for sym in COIN_LIST]
-                responses = await asyncio.gather(*tasks)
-                vols = [float(r[-1][5]) for r in responses if r]
-                market_median = median(vols) if vols else 1
+            signals = [r for r in res if r]
 
-                # SCAN
-                results = [r for r in await asyncio.gather(*[scan_coin(session, sym, market_median, 2) for sym in COIN_LIST]) if r]
-                
-                if results:
-                    print(f"\n✅ BULUNDU! {results}")
-                    await send_telegram(session, results[0], results[0])
-                else:
-                    print("\n❌ Sonuç yok.")
+            for s in signals:
+                msg = f"{s['symbol']} {s['direction']} | SCORE {s['score']} | REGIME {s['regime']}"
+                print(msg)
+                await send(session, msg)
 
-                await asyncio.sleep(12)
-
-            except Exception as e:
-                print(f"Kritik hata: {e}")
-                await asyncio.sleep(30)
+            await asyncio.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
     asyncio.run(main())
