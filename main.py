@@ -16,6 +16,18 @@ HEADERS = {
 SPOT_URL = "https://api.binance.com"
 FUTURES_URL = "https://fapi.binance.com"
 
+# ESKİ ÇALIŞAN KODDAKİ GİBİ SABİT PARİTE LİSTEMİZ (Sunucuyu kilitlemez)
+COINS = [
+    "1000LUNC", "1000SHIB", "1000XEC", "ADA", "AGLD", "APE", "APT", "AR", "ARB", "ARKM",
+    "ATOM", "AVAX", "BANANA", "BCH", "BLUR", "BNB", "BONK", "CELO", "CRV", "CYBER",
+    "DOGE", "DOT", "DYDX", "EGLD", "ENS", "EOS", "ETC", "ETH", "FIL", "FLOW",
+    "FTM", "FXS", "GALA", "GMT", "GRT", "ICP", "IMX", "INJ", "IOTA", "JUP",
+    "LDO", "LINK", "LTC", "LUNA", "MAGIC", "MANA", "MATIC", "MINA", "MKR", "NEAR",
+    "NEO", "OP", "ORDI", "PEPE", "PYTH", "RNDR", "RUNE", "SAND", "SEI", "SOL",
+    "STX", "SUI", "TIA", "TRX", "UMA", "UNI", "WIF", "WORLD", "XLM", "XMR",
+    "XRP", "YGG", "ZETA"
+]
+
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -23,41 +35,12 @@ def send_telegram(msg):
     except:
         pass
 
-def get_all_market_pairs():
-    """Hem Spot hem de Futures evrenindeki tüm benzersiz USDT çiftlerini toplar."""
-    pairs = set()
-    # 1. Vadeli Çiftleri Çek
-    try:
-        f_res = requests.get(f"{FUTURES_URL}/fapi/v1/exchangeInfo", headers=HEADERS, timeout=5).json()
-        for s in f_res.get('symbols', []):
-            if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING':
-                pairs.add((s['symbol'], "Futures"))
-    except:
-        pass
-    
-    # 2. Spot Çiftleri Çek
-    try:
-        s_res = requests.get(f"{SPOT_URL}/api/v3/exchangeInfo", headers=HEADERS, timeout=5).json()
-        for s in s_res.get('symbols', []):
-            if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING':
-                pairs.add((s['symbol'], "Spot"))
-    except:
-        pass
-    
-    return list(pairs)
-
 def main():
-    print("🔥 BOT HİBRİT MODDA BAŞLATILDI: ZIRHLI (VADELİ) | ACABA (SPOT & VADELİ) 🔥")
+    print("🚀 SABİT LİSTE VE YENİ GÜÇLÜ FİLTRELERLE BOT BAŞLATILDI... 🚀")
     sent_dict = {}
     
     while True:
-        market_pairs = get_all_market_pairs()
-        if not market_pairs:
-            print("⚠️ Çiftler çekilemedi, 30 saniye sonra tekrar denenecek...")
-            time.sleep(30)
-            continue
-            
-        print(f"\n[{time.strftime('%H:%M:%S')}] {len(market_pairs)} Hibrit Parite Analiz Ediliyor...")
+        print(f"\n[{time.strftime('%H:%M:%S')}] {len(COINS)} Parite Taranıyor...")
         
         # 1. BTC VADELİ HACİM KONTROLÜ (Piyasa Güvenliği)
         btc_is_pumping = False
@@ -70,47 +53,35 @@ def main():
             pass
 
         if btc_is_pumping:
-            print("⚠️ BTC tahtasında ani agresif hacim! Tarama güvenlik için 1 dk erteleniyor...")
+            print("⚠️ BTC tahtasında agresif hacim! Güvenlik için 1 dakika erteleniyor...")
             time.sleep(60)
             continue
 
-        # 2. 24s TICKER VERİLERİNİ TEK SEFERDE ÇEK
-        f_ticker_dict, s_ticker_dict = {}, {}
+        # 2. 24s TICKER VERİLERİNİ TEK SEFERDE ÇEK (Piyasa Hacmi İçin tek istek)
+        f_ticker_dict = {}
         try:
             f_tickers = requests.get(f"{FUTURES_URL}/fapi/v1/ticker/24hr", headers=HEADERS, timeout=4).json()
             for t in f_tickers:
                 f_ticker_dict[t['symbol']] = t
         except:
-            pass
-        try:
-            s_tickers = requests.get(f"{SPOT_URL}/api/v3/ticker/24hr", headers=HEADERS, timeout=4).json()
-            for t in s_tickers:
-                s_ticker_dict[t['symbol']] = t
-        except:
-            pass
+            print("⚠️ 24s Ticker verisi çekilemedi, bir sonraki döngüde denenecek.")
+            time.sleep(10)
+            continue
 
-        for symbol, market_type in market_pairs:
+        for coin in COINS:
+            symbol = f"{coin}USDT"
             try:
-                time.sleep(0.04) # API Rate Limit Dostu Gecikme
+                time.sleep(0.2) # Rate limit yememek için güvenli bekleme süresi artırıldı
                 
-                if market_type == "Futures":
-                    base_url = FUTURES_URL
-                    endpoint = "/fapi/v1/klines"
-                    ticker_pool = f_ticker_dict
-                else:
-                    base_url = SPOT_URL
-                    endpoint = "/api/v3/klines"
-                    ticker_pool = s_ticker_dict
-                
-                if symbol not in ticker_pool:
+                if symbol not in f_ticker_dict:
                     continue
                 
                 # Günlük %8'den fazla fırlamışları doğrudan ele
-                if float(ticker_pool[symbol].get('priceChangePercent', 0)) > 8.0:
+                if float(f_ticker_dict[symbol].get('priceChangePercent', 0)) > 8.0:
                     continue
                 
-                # 3. 5 DAKİKALIK MUM VE TAKER BUY VERİLERİ
-                res = requests.get(f"{base_url}{endpoint}", params={"symbol": symbol, "interval": "5m", "limit": 20}, headers=HEADERS, timeout=4)
+                # 3. 5 DAKİKALIK MUM VE TAKER BUY VERİLERİ (Vadeli Tahtadan)
+                res = requests.get(f"{FUTURES_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "5m", "limit": 20}, headers=HEADERS, timeout=4)
                 if res.status_code != 200:
                     continue
                 klines = res.json()
@@ -125,15 +96,15 @@ def main():
                 current_vol = float(klines[-1][5])
                 taker_buy_vol = float(klines[-1][9])
                 
-                # ORTAK KRİTİK KALKANLAR
+                # 🛡️ KRİTİK KALKANLAR (Senin en çok verim aldığın yerler)
                 if current_close <= current_open:
                     continue
-                if taker_buy_vol < (current_vol * 0.55):
+                if taker_buy_vol < (current_vol * 0.55): # Taker Buy Filtresi
                     continue
                 if current_close < mean(prices[:-1]):
                     continue
 
-                # YATAYLIK FORMASYONU (Son 1.5 saat içinde fiyat max %4 oynamış olmalı)
+                # YATAYLIK FORMASYONU (Sıkışma Kontrolü)
                 past_prices = prices[:-1]
                 if (max(past_prices) - min(past_prices)) / min(past_prices) > 0.04:
                     continue 
@@ -147,16 +118,14 @@ def main():
                 if ratio < 3.0:
                     continue 
 
-                quote_vol = float(ticker_pool[symbol].get('quoteVolume', 0))
-                score = 3
-                stars = "⭐" * score
-
+                quote_vol = float(f_ticker_dict[symbol].get('quoteVolume', 0))
+                
                 # --------------------------------------------------------
-                # 💎 SINIF 1: ZIRHLI SİNYAL KONTROLÜ (YALNIZCA VADELİ PİYASA)
+                # 💎 SINIF 1: ZIRHLI SİNYAL KONTROLÜ (VADELİ DESTEKLİ)
                 # --------------------------------------------------------
-                if market_type == "Futures" and ratio > 5.0 and quote_vol > 10000000:
+                if ratio > 5.0 and quote_vol > 10000000:
                     
-                    # 7 Günlük Gerçek Dip Kontrolü (Hatanın düzeltildiği yer 🛠️)
+                    # 7 Günlük Gerçek Dip Kontrolü
                     try:
                         res_7d = requests.get(f"{FUTURES_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1d", "limit": 7}, headers=HEADERS, timeout=4).json()
                         max_7d_high = max([float(k[2]) for k in res_7d])
@@ -188,7 +157,8 @@ def main():
                     except:
                         continue
 
-                    # L/S Divergansı
+                    # L/S Divergansı & Yıldız Skorlama
+                    score = 4
                     try:
                         ls_res = requests.get(f"{FUTURES_URL}/futures/data/globalLongShortAccountRatio", params={"symbol": symbol, "period": "5m", "limit": 2}, headers=HEADERS, timeout=3).json()
                         if len(ls_res) >= 2 and float(ls_res[1]['longAccount']) < float(ls_res[0]['longAccount']):
@@ -196,13 +166,12 @@ def main():
                     except:
                         pass
                     
-                    score += 1
                     stars = "⭐" * score
 
                     if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
                         send_telegram(f"💎 *ZIRHLI VADELİ SİNYAL* #{symbol}\n\n"
                                       f"• *Güven Skoru:* {stars}\n"
-                                      f"• Hacim Patlaması: {round(ratio,1)}x (Vadeli)\n"
+                                      f"• Hacim Patlaması: {round(ratio,1)}x\n"
                                       f"• Para Girişi (OI): +%{round(oi_change,2)}\n"
                                       f"• Fonlama Oranı: %{round(funding_rate*100,3)}\n"
                                       f"• Durum: 7 Günlük Dipte Sıkışma Kırılımı\n"
@@ -211,16 +180,16 @@ def main():
                         continue
 
                 # --------------------------------------------------------
-                # 🤔 SINIF 2: ACABA SİNYALİ KONTROLÜ (HEM SPOT HEM VADELİ)
+                # 🤔 SINIF 2: ACABA SİNYALİ KONTROLÜ
                 # --------------------------------------------------------
                 if ratio > 3.0 and quote_vol > 1000000:
                     if symbol not in sent_dict or (time.time() - sent_dict[symbol] > 3600):
+                        stars = "⭐" * 3
                         if ratio > 5.0:
                             stars += "⭐"
                         
-                        send_telegram(f"🤔 *ACABA HİBRİT SİNYALİ* #{symbol}\n\n"
+                        send_telegram(f"🤔 *ACABA SİNYALİ* #{symbol}\n\n"
                                       f"• *Güven Skoru:* {stars}\n"
-                                      f"• *Kaynak Piyasa:* {market_type}\n"
                                       f"• Hacim Patlaması: {round(ratio,1)}x\n"
                                       f"• Konum: Dip Bölgesi Gerçek Alıcı Baskısı\n"
                                       f"• Not: Sabırlı Akümülasyondan Çıkış")
